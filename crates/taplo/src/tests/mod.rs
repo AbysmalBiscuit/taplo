@@ -75,3 +75,14 @@ other = "v2"
 
     assert_eq!(matched, vec!["name1"]);
 }
+
+#[test]
+fn datetime_with_leading_zeros() {
+    let src = r#"
+token_expires_at = 0001-01-01T00:00:00Z
+"#;
+
+    let errors = parse(src).errors;
+
+    assert!(errors.is_empty(), "{:#?}", errors);
+}
