@@ -13,10 +13,7 @@ pub async fn configuration_change<E: Environment>(
     context: Context<World<E>>,
     params: Params<DidChangeConfigurationParams>,
 ) {
-    let p = match params.optional() {
-        None => return,
-        Some(p) => p,
-    };
+    let Some(p) = params.optional() else { return };
 
     let mut workspaces = context.workspaces.write().await;
 

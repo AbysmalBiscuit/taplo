@@ -19,10 +19,7 @@ pub(crate) async fn document_open<E: Environment>(
     mut context: Context<World<E>>,
     params: Params<DidOpenTextDocumentParams>,
 ) {
-    let p = match params.optional() {
-        None => return,
-        Some(p) => p,
-    };
+    let Some(p) = params.optional() else { return };
 
     let mut workspaces = context.workspaces.write().await;
     let ws = workspaces.by_document_mut(&p.text_document.uri);
@@ -91,15 +88,13 @@ pub(crate) async fn document_change<E: Environment>(
     mut context: Context<World<E>>,
     params: Params<DidChangeTextDocumentParams>,
 ) {
-    let mut p = match params.optional() {
-        None => return,
-        Some(p) => p,
+    let Some(mut p) = params.optional() else {
+        return;
     };
 
     // We expect one full change
-    let change = match p.content_changes.pop() {
-        None => return,
-        Some(c) => c,
+    let Some(change) = p.content_changes.pop() else {
+        return;
     };
 
     let mut workspaces = context.workspaces.write().await;
@@ -167,10 +162,7 @@ pub(crate) async fn document_close<E: Environment>(
     context: Context<World<E>>,
     params: Params<DidCloseTextDocumentParams>,
 ) {
-    let p = match params.optional() {
-        None => return,
-        Some(p) => p,
-    };
+    let Some(p) = params.optional() else { return };
 
     let mut workspaces = context.workspaces.write().await;
     let ws = workspaces.by_document_mut(&p.text_document.uri);

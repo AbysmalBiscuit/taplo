@@ -10,7 +10,8 @@
     clippy::missing_fields_in_debug,
     clippy::similar_names,
     clippy::too_many_lines,
-    clippy::needless_continue
+    clippy::needless_continue,
+    clippy::struct_field_names
 )]
 
 pub mod config;
