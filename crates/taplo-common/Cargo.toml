@@ -57,3 +57,6 @@ tokio = { workspace = true, features = ["io-util", "parking_lot", "sync"] }
 
 [package.metadata.auto-tag]
 enabled = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

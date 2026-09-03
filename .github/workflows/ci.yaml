@@ -50,6 +50,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test Taplo
         run: cargo test -p taplo
+      - name: Test Taplo common
+        run: cargo test -p taplo-common --features schema,reqwest,rustls-tls
       - name: Check formatting regression
         run: cargo run -- fmt --check
       - name: Check if git index is clean

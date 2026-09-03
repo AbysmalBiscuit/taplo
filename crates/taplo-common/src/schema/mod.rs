@@ -22,6 +22,9 @@ pub mod associations;
 pub mod cache;
 pub mod ext;
 
+#[cfg(all(test, feature = "reqwest"))]
+mod tests;
+
 pub mod builtins {
     use serde_json::Value;
     use std::sync::Arc;
@@ -43,6 +46,11 @@ pub mod builtins {
         }
     }
 }
+
+/// `$ref`, `allOf`, `oneOf` and `anyOf` can point back at the schema that
+/// contains them. Such a cycle makes no progress against the traversal depth,
+/// which only counts property nesting, so composition gets its own budget.
+const MAX_COMPOSITION_DEPTH: usize = 32;
 
 #[derive(Clone)]
 pub struct Schemas<E: Environment> {
@@ -477,6 +485,7 @@ impl<E: Environment> Schemas<E> {
                 &path,
                 &Keys::empty(),
                 max_depth,
+                MAX_COMPOSITION_DEPTH,
                 &mut children,
             )
             .await;
@@ -500,29 +509,56 @@ impl<E: Environment> Schemas<E> {
         root_path: &Keys,
         path: &Keys,
         mut depth: usize,
+        composition_depth: usize,
         schemas: &mut Vec<(Keys, Keys, Arc<Value>)>,
     ) {
-        if !schema.is_object() || depth == 0 {
+        if !schema.is_object() || depth == 0 || composition_depth == 0 {
             return;
         }
 
+        let composition_depth = composition_depth - 1;
+
         if let Some(schema) = self.ref_schema_value(root_url, schema).await {
             return self
-                .collect_child_schemas(root_url, &schema, root_path, path, depth, schemas)
+                .collect_child_schemas(
+                    root_url,
+                    &schema,
+                    root_path,
+                    path,
+                    depth,
+                    composition_depth,
+                    schemas,
+                )
                 .await;
         }
 
         if let Some(one_ofs) = schema["oneOf"].as_array() {
             for one_of in one_ofs {
-                self.collect_child_schemas(root_url, one_of, root_path, path, depth, schemas)
-                    .await;
+                self.collect_child_schemas(
+                    root_url,
+                    one_of,
+                    root_path,
+                    path,
+                    depth,
+                    composition_depth,
+                    schemas,
+                )
+                .await;
             }
         }
 
         if let Some(any_ofs) = schema["anyOf"].as_array() {
             for any_of in any_ofs {
-                self.collect_child_schemas(root_url, any_of, root_path, path, depth, schemas)
-                    .await;
+                self.collect_child_schemas(
+                    root_url,
+                    any_of,
+                    root_path,
+                    path,
+                    depth,
+                    composition_depth,
+                    schemas,
+                )
+                .await;
             }
         }
 
@@ -542,7 +578,7 @@ impl<E: Environment> Schemas<E> {
         if let Some(all_ofs) = schema["allOf"].as_array() {
             if !all_ofs.is_empty() && composed {
                 let mut schema = schema.clone();
-                if let Some(obj) = schema["allOf"].as_object_mut() {
+                if let Some(obj) = schema.as_object_mut() {
                     obj.remove("allOf");
                 }
 
@@ -563,12 +599,12 @@ impl<E: Environment> Schemas<E> {
                     root_path,
                     path,
                     depth,
+                    composition_depth,
                     schemas,
                 )
                 .await;
             }
             // TODO: handle allOfs in regular schemas.
-            // doing so currently will overflow the stack.
         }
 
         let include_self = !composed;
@@ -591,6 +627,7 @@ impl<E: Environment> Schemas<E> {
                     root_path,
                     &path.join(Key::from(k)),
                     depth,
+                    MAX_COMPOSITION_DEPTH,
                     schemas,
                 )
                 .await;
