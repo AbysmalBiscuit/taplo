@@ -340,6 +340,38 @@ fn default_fact(schema: &Value) -> Option<Fact> {
     })
 }
 
+/// Reads a boolean annotation, which counts only when written as `true`.
+///
+/// The keyword is defined as a boolean, so any other shape is a schema the
+/// specification does not describe and Taplo declines to guess at.
+fn flag(schema: &Value, keyword: &str) -> bool {
+    schema[keyword].as_bool().unwrap_or(false)
+}
+
+pub(crate) fn is_deprecated(schema: &Value) -> bool {
+    flag(schema, "deprecated")
+}
+
+/// Renders a schema's `examples` as TOML literals, dropping any that is not a
+/// TOML value so that one bad entry does not cost the reader the others.
+fn examples_fact(schema: &Value) -> Option<Fact> {
+    let values: Vec<String> = schema["examples"]
+        .as_array()?
+        .iter()
+        .filter_map(|example| serde_json::from_value::<Node>(example.clone()).ok())
+        .map(|node| node.to_toml(true, false))
+        .collect();
+
+    if values.is_empty() {
+        return None;
+    }
+
+    Some(Fact {
+        label: "Examples",
+        values,
+    })
+}
+
 /// The prose a schema offers for a key.
 ///
 /// `x-taplo.docs.main` is Taplo's own override and outranks both standard
@@ -372,9 +404,22 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
         }
     }
 
+    if is_deprecated(schema) {
+        sections.banners.push("> **Deprecated**".into());
+    }
+
     sections.docs = schema_docs(schema);
 
     sections.facts.extend(default_fact(schema));
+    sections.facts.extend(examples_fact(schema));
+
+    if flag(schema, "readOnly") {
+        sections.facts.push(Fact { label: "Read-only", values: Vec::new() });
+    }
+
+    if flag(schema, "writeOnly") {
+        sections.facts.push(Fact { label: "Write-only", values: Vec::new() });
+    }
 
     sections
 }
@@ -672,6 +717,104 @@ pub(crate) mod tests {
         assert_eq!(
             hover_at(schema, "port = 8080\n", 8).await.as_deref(),
             Some("Port")
+        );
+    }
+
+    /// Wraps a property schema in an object schema and hovers its key.
+    async fn key_hover_for(property: serde_json::Value) -> Option<String> {
+        let schema = json!({ "type": "object", "properties": { "port": property } });
+        hover_at(schema, "port = 8080\n", 1).await
+    }
+
+    #[tokio::test]
+    async fn key_hover_lists_examples() {
+        let content = key_hover_for(json!({ "type": "integer", "examples": [80, 443] }))
+            .await
+            .unwrap();
+
+        assert_eq!(content, "- Examples: `80`, `443`");
+    }
+
+    #[tokio::test]
+    async fn key_hover_skips_examples_that_are_not_toml_values() {
+        let content = key_hover_for(json!({ "type": "integer", "examples": [80, null] }))
+            .await
+            .unwrap();
+
+        assert_eq!(content, "- Examples: `80`");
+    }
+
+    #[tokio::test]
+    async fn key_hover_ignores_a_non_array_examples() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "examples": 80 })).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_banners_a_deprecated_key_above_the_docs() {
+        let content = key_hover_for(json!({
+            "type": "integer",
+            "description": "The port.",
+            "deprecated": true
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(content, "> **Deprecated**\n\nThe port.");
+    }
+
+    #[tokio::test]
+    async fn key_hover_ignores_a_deprecated_that_is_not_true() {
+        for deprecated in [json!(false), json!("yes"), json!(1)] {
+            assert_eq!(
+                key_hover_for(json!({ "type": "integer", "deprecated": deprecated })).await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hover_notes_read_only_and_write_only() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "readOnly": true }))
+                .await
+                .unwrap(),
+            "- Read-only"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "writeOnly": true }))
+                .await
+                .unwrap(),
+            "- Write-only"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "readOnly": true, "writeOnly": true }))
+                .await
+                .unwrap(),
+            "- Read-only\n- Write-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_orders_values_before_access() {
+        let content = key_hover_for(json!({
+            "type": "integer",
+            "description": "The port.",
+            "default": 8080,
+            "examples": [80],
+            "readOnly": true,
+            "deprecated": true
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            content,
+            "> **Deprecated**\n\nThe port.\n\n- Default: `8080`\n- Examples: `80`\n- Read-only"
         );
     }
 }
