@@ -87,7 +87,7 @@ Rendering any of the newly validated keywords in hover text. That is the "Constr
 
 So Taplo reads `$schema` itself, normalizes away the fragment, maps the result to a `Draft`, and passes it explicitly. This routes around defect 2 without patching or forking the dependency.
 
-Normalization strips one trailing `#`, and nothing else. A `$schema` value that differs from a known meta-schema URI in any other way stays unrecognized, which is the correct outcome.
+Classification compares the host and path of the parsed URI, so scheme, case, query and fragment do not matter. A different path on `json-schema.org` is unsupported; a different host is unrecognized.
 
 ### Keep format validation on
 
@@ -106,7 +106,7 @@ Detection lives in `create_validator`, which maps `$schema` to the value it pass
 ```rust
 enum DeclaredDraft {
     Supported(jsonschema::Draft),
-    Unsupported(&'static str),
+    Unsupported(String),
     Unrecognized,
 }
 
@@ -149,7 +149,7 @@ This is a conformance deviation and it is accepted. It only adds constraints the
 
 **Keywords next to `$ref` start validating under 2019-09 and 2020-12.** `compile_validators` in `jsonschema` isolates `$ref` and drops its siblings unless `supports_adjacent_validation(draft)` holds, which it does only for the two new drafts. A 2020-12 schema written as `{"$ref": "...", "type": "string"}` validates the reference alone today; after this change both apply. Correct per spec, and a source of new diagnostics. Traversal in `collect_schemas` still returns at `$ref` without reading siblings; that gap is unchanged and belongs with the `$ref` resolution work in the tracking issue.
 
-**Draft-4 and draft-6 schemas that omit the trailing `#` change behavior.** `draft_from_url` demands the `#` for every draft, not only 2020-12, so a schema declaring `http://json-schema.org/draft-04/schema` runs as draft 7 today and will run as draft 4 after normalization: `id` instead of `$id` for scoping, boolean `exclusiveMaximum`, draft-4 `type` rules, no `const`, `contains`, `propertyNames` or `if`, and meta-schema validation (`validate_schema` defaults to on) against the draft-4 meta-schema instead of draft-7's. A schema that declares draft-04 but uses draft-6 constructs compiles today and will be rejected as an invalid schema. In the editor that failure is only logged and the document gets no schema diagnostics at all; `taplo lint` fails the file with `invalid schema`. Exposure is small, since the fragment-less form is canonical only from 2019-09 onward. Normalizing only the 2019-09 and 2020-12 URIs would avoid this but would keep the same silent mis-validation this spec exists to remove; one rule for every draft wins.
+**Draft-4 and draft-6 schemas that omit the trailing `#` change behavior.** `draft_from_url` demands the `#` for every draft, not only 2020-12, so a schema declaring `http://json-schema.org/draft-04/schema` runs as draft 7 today and will run as draft 4 after normalization: `id` instead of `$id` for scoping, boolean `exclusiveMaximum`, draft-4 `type` rules, no `const`, `contains`, `propertyNames` or `if`, and meta-schema validation (`validate_schema` defaults to on) against the draft-4 meta-schema instead of draft-7's. A schema that declares draft-04 but uses later constructs either has them ignored (`const`, `contains`, `propertyNames`, `if`, which the draft-4 meta-schema does not know) or is rejected as an invalid schema (numeric `exclusiveMaximum`, boolean subschemas, which the draft-4 meta-schema forbids). In the editor that failure is only logged and the document gets no schema diagnostics at all; `taplo lint` fails the file with `invalid schema`. Exposure is small, since the fragment-less form is canonical only from 2019-09 onward. Normalizing only the 2019-09 and 2020-12 URIs would avoid this but would keep the same silent mis-validation this spec exists to remove; one rule for every draft wins.
 
 **Seven built-in formats stop asserting for schemas that declare 2020-12.** `idn-hostname`, `iri`, `iri-reference`, `json-pointer`, `relative-json-pointer`, `uri-reference` and `uri-template` have no 2020-12 arm in `format::compile`. A 2020-12 schema with `"format": "uri-reference"` rejects a malformed value today, because it ran as draft 7, and accepts it after this change. The crate's format validators are `pub(crate)`, so re-registering them through `with_format` means reimplementing the checks. Accepted; the `jsonschema` upgrade closes the gap.
 
@@ -176,7 +176,9 @@ Measured on the stripped release `taplo` binary, built with `cargo build --relea
 | Build | Size |
 |---|---|
 | without the features | 11,834,800 bytes |
-| with both features | *(recorded during implementation)* |
+| with both features | 11,982,320 bytes |
+
+The two features add 147,520 bytes, 1.25% of the baseline.
 
 Re-measure by toggling the two features in `crates/taplo-common/Cargo.toml` and comparing `ls -l target/release/taplo` across the two builds.
 
