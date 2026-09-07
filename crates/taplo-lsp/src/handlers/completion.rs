@@ -4,11 +4,12 @@ use lsp_async_stub::{
     Context, Params,
 };
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
-    Documentation, InsertTextFormat, MarkupContent, Range, TextEdit,
+    CompletionItem, CompletionItemKind, CompletionItemTag, CompletionParams, CompletionResponse,
+    CompletionTextEdit, Documentation, InsertTextFormat, MarkupContent, Range, TextEdit,
 };
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use taplo::dom::{node::TableKind, Keys, Node};
 use taplo_common::{
@@ -120,14 +121,13 @@ pub async fn completion<E: Environment>(
                 .map(|(full_key, _, s)| CompletionItem {
                     label: full_key.to_string(),
                     kind: Some(CompletionItemKind::STRUCT),
-                    documentation: documentation(&s),
                     text_edit: key_range.map(|r| {
                         CompletionTextEdit::Edit(TextEdit {
                             range: doc.mapper.range(r).unwrap().into_lsp(),
                             new_text: full_key.to_string(),
                         })
                     }),
-                    ..Default::default()
+                    ..schema_annotated_item(&s)
                 })
                 .collect(),
         )));
@@ -170,14 +170,13 @@ pub async fn completion<E: Environment>(
                 .map(|(full_key, _, s)| CompletionItem {
                     label: full_key.to_string(),
                     kind: Some(CompletionItemKind::STRUCT),
-                    documentation: documentation(&s),
                     text_edit: key_range.map(|r| {
                         CompletionTextEdit::Edit(TextEdit {
                             range: doc.mapper.range(r).unwrap().into_lsp(),
                             new_text: full_key.to_string(),
                         })
                     }),
-                    ..Default::default()
+                    ..schema_annotated_item(&s)
                 })
                 .collect(),
         )));
@@ -214,10 +213,9 @@ pub async fn completion<E: Environment>(
                 .map(|(_, relative_keys, schema)| CompletionItem {
                     label: relative_keys.to_string(),
                     kind: Some(CompletionItemKind::VARIABLE),
-                    documentation: documentation(&schema),
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
                     insert_text: Some(new_entry_snippet(&relative_keys, &schema, false)),
-                    ..Default::default()
+                    ..schema_annotated_item(&schema)
                 })
                 .collect(),
         )));
@@ -261,7 +259,6 @@ pub async fn completion<E: Environment>(
                 .map(|(_, relative_keys, schema)| CompletionItem {
                     label: relative_keys.to_string(),
                     kind: Some(CompletionItemKind::VARIABLE),
-                    documentation: documentation(&schema),
                     text_edit: key_range.map(|r| {
                         CompletionTextEdit::Edit(TextEdit {
                             range: doc.mapper.range(r).unwrap().into_lsp(),
@@ -282,7 +279,7 @@ pub async fn completion<E: Environment>(
                     } else {
                         Some(InsertTextFormat::SNIPPET)
                     },
-                    ..Default::default()
+                    ..schema_annotated_item(&schema)
                 })
                 .collect(),
         )));
@@ -321,10 +318,9 @@ pub async fn completion<E: Environment>(
                     .map(|(_, relative_keys, schema)| CompletionItem {
                         label: relative_keys.to_string(),
                         kind: Some(CompletionItemKind::VARIABLE),
-                        documentation: documentation(&schema),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         insert_text: Some(new_entry_snippet(&relative_keys, &schema, false)),
-                        ..Default::default()
+                        ..schema_annotated_item(&schema)
                     })
                     .collect(),
             )));
@@ -419,7 +415,6 @@ pub async fn completion<E: Environment>(
             .map(|(_, relative_keys, schema)| CompletionItem {
                 label: relative_keys.to_string(),
                 kind: Some(CompletionItemKind::VARIABLE),
-                documentation: documentation(&schema),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                     range: doc
@@ -429,7 +424,7 @@ pub async fn completion<E: Environment>(
                         .into_lsp(),
                     new_text: new_entry_snippet(&relative_keys, &schema, false),
                 })),
-                ..Default::default()
+                ..schema_annotated_item(&schema)
             })
             .collect(),
     )))
@@ -444,7 +439,56 @@ fn documentation(schema: &Value) -> Option<Documentation> {
     })
 }
 
+/// The parts of a completion item that come from the schema rather than from
+/// the position in the document.
+///
+/// Taplo sets both `tags` and the superseded `deprecated` because it never
+/// reads the client's capabilities and so cannot tell which one the client
+/// understands. Both are omitted from the wire when unset.
+fn schema_annotated_item(schema: &Value) -> CompletionItem {
+    let deprecated = super::hover::is_deprecated(schema);
+
+    CompletionItem {
+        documentation: documentation(schema),
+        tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+        deprecated: deprecated.then_some(true),
+        ..Default::default()
+    }
+}
+
+/// Renders a JSON value as a TOML literal, or nothing when it has no TOML
+/// representation, as a null does.
+fn toml_literal(value: &Value, single_quote: bool) -> Option<String> {
+    let node: Node = serde_json::from_value(value.clone()).ok()?;
+    Some(node.to_toml(true, single_quote))
+}
+
 fn add_value_completions(
+    schema: &Value,
+    range: Option<Range>,
+    completions: &mut Vec<CompletionItem>,
+    single_quote: bool,
+) {
+    let first = completions.len();
+
+    add_value_completions_inner(schema, range, completions, single_quote);
+
+    // A schema can offer the same literal as its default, one of its examples
+    // and its type's placeholder. Only this call's items are compared, so two
+    // branches of a `oneOf` still each contribute their own candidates.
+    let mut seen = HashSet::new();
+    let mut index = first;
+
+    while index < completions.len() {
+        if seen.insert(completions[index].label.clone()) {
+            index += 1;
+        } else {
+            completions.remove(index);
+        }
+    }
+}
+
+fn add_value_completions_inner(
     schema: &Value,
     range: Option<Range>,
     completions: &mut Vec<CompletionItem>,
@@ -455,6 +499,7 @@ fn add_value_completions(
     let enum_docs = ext_docs.enum_values.unwrap_or_default();
 
     let schema_docs = super::hover::schema_docs(schema);
+    let deprecated = super::hover::is_deprecated(schema);
 
     if let Some(enum_values) = schema["enum"].as_array() {
         for (idx, val) in enum_values.iter().enumerate() {
@@ -486,6 +531,8 @@ fn add_value_completions(
                             value,
                         })
                     }),
+                tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                deprecated: deprecated.then_some(true),
                 text_edit: range.map(|range| {
                     CompletionTextEdit::Edit(TextEdit {
                         range,
@@ -499,17 +546,13 @@ fn add_value_completions(
     }
 
     if let Some(const_value) = schema.get("const") {
-        if !const_value.is_null() {
-            let node: Node = serde_json::from_value(const_value.clone()).unwrap();
-            let toml_value = node.to_toml(true, single_quote);
+        if let Some(toml_value) = toml_literal(const_value, single_quote) {
             completions.push(CompletionItem {
                 label: toml_value.clone(),
-                kind: Some(match node {
-                    Node::Table(_) => CompletionItemKind::STRUCT,
-                    _ => CompletionItemKind::VALUE,
-                }),
+                kind: Some(CompletionItemKind::VALUE),
                 documentation: ext_docs
                     .const_value
+                    .clone()
                     .or_else(|| schema_docs.clone())
                     .map(|value| {
                         Documentation::MarkupContent(MarkupContent {
@@ -517,6 +560,8 @@ fn add_value_completions(
                             value,
                         })
                     }),
+                tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                deprecated: deprecated.then_some(true),
                 text_edit: range.map(|range| {
                     CompletionTextEdit::Edit(TextEdit {
                         range,
@@ -531,23 +576,52 @@ fn add_value_completions(
     }
 
     if let Some(default_value) = schema.get("default") {
-        if !default_value.is_null() {
-            let node: Node = serde_json::from_value(default_value.clone()).unwrap();
-            let toml_value = node.to_toml(true, single_quote);
+        if let Some(toml_value) = toml_literal(default_value, single_quote) {
             completions.push(CompletionItem {
                 label: toml_value.clone(),
-                kind: Some(match node {
-                    Node::Table(_) => CompletionItemKind::STRUCT,
-                    _ => CompletionItemKind::VALUE,
-                }),
-                documentation: ext_docs.default_value.or_else(|| schema_docs.clone()).map(
-                    |value| {
+                detail: Some("default".into()),
+                kind: Some(CompletionItemKind::VALUE),
+                documentation: ext_docs
+                    .default_value
+                    .clone()
+                    .or_else(|| schema_docs.clone())
+                    .map(|value| {
                         Documentation::MarkupContent(MarkupContent {
                             kind: lsp_types::MarkupKind::Markdown,
                             value,
                         })
-                    },
-                ),
+                    }),
+                tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                deprecated: deprecated.then_some(true),
+                text_edit: range.map(|range| {
+                    CompletionTextEdit::Edit(TextEdit {
+                        range,
+                        new_text: toml_value,
+                    })
+                }),
+                ..Default::default()
+            });
+        }
+    }
+
+    if let Some(examples) = schema["examples"].as_array() {
+        for example in examples {
+            let Some(toml_value) = toml_literal(example, single_quote) else {
+                continue;
+            };
+
+            completions.push(CompletionItem {
+                label: toml_value.clone(),
+                detail: Some("example".into()),
+                kind: Some(CompletionItemKind::VALUE),
+                documentation: schema_docs.clone().map(|value| {
+                    Documentation::MarkupContent(MarkupContent {
+                        kind: lsp_types::MarkupKind::Markdown,
+                        value,
+                    })
+                }),
+                tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                deprecated: deprecated.then_some(true),
                 text_edit: range.map(|range| {
                     CompletionTextEdit::Edit(TextEdit {
                         range,
@@ -577,6 +651,8 @@ fn add_value_completions(
                             kind: lsp_types::MarkupKind::Markdown,
                             value: schema_docs.clone().unwrap_or_else(|| "string".into()),
                         })),
+                        tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                        deprecated: deprecated.then_some(true),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         text_edit: range.map(|range| {
                             CompletionTextEdit::Edit(TextEdit {
@@ -595,6 +671,8 @@ fn add_value_completions(
                             kind: lsp_types::MarkupKind::Markdown,
                             value: schema_docs.clone().unwrap_or_else(|| "true value".into()),
                         })),
+                        tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                        deprecated: deprecated.then_some(true),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         text_edit: range.map(|range| {
                             CompletionTextEdit::Edit(TextEdit {
@@ -611,6 +689,8 @@ fn add_value_completions(
                             kind: lsp_types::MarkupKind::Markdown,
                             value: schema_docs.clone().unwrap_or_else(|| "false value".into()),
                         })),
+                        tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                        deprecated: deprecated.then_some(true),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         text_edit: range.map(|range| {
                             CompletionTextEdit::Edit(TextEdit {
@@ -629,6 +709,8 @@ fn add_value_completions(
                             kind: lsp_types::MarkupKind::Markdown,
                             value: schema_docs.clone().unwrap_or_else(|| "array".into()),
                         })),
+                        tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                        deprecated: deprecated.then_some(true),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         text_edit: range.map(|range| {
                             CompletionTextEdit::Edit(TextEdit {
@@ -647,6 +729,8 @@ fn add_value_completions(
                             kind: lsp_types::MarkupKind::Markdown,
                             value: schema_docs.clone().unwrap_or_else(|| "object".into()),
                         })),
+                        tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                        deprecated: deprecated.then_some(true),
                         insert_text_format: Some(InsertTextFormat::SNIPPET),
                         text_edit: range.map(|range| {
                             CompletionTextEdit::Edit(TextEdit {
@@ -674,16 +758,14 @@ fn default_value_snippet(
     single_quote: bool,
 ) -> Cow<'static, str> {
     if let Some(const_value) = schema.get("const") {
-        if !const_value.is_null() {
-            let node: Node = serde_json::from_value(const_value.clone()).unwrap();
-            return format!("${{{}:{}}}", cursor_count, node.to_toml(true, single_quote)).into();
+        if let Some(toml_value) = toml_literal(const_value, single_quote) {
+            return format!("${{{cursor_count}:{toml_value}}}").into();
         }
     }
 
     if let Some(default_value) = schema.get("default") {
-        if !default_value.is_null() {
-            let node: Node = serde_json::from_value(default_value.clone()).unwrap();
-            return format!("${{{}:{}}}", cursor_count, node.to_toml(true, single_quote)).into();
+        if let Some(toml_value) = toml_literal(default_value, single_quote) {
+            return format!("${{{cursor_count}:{toml_value}}}").into();
         }
     }
 
@@ -751,5 +833,151 @@ fn empty_value_snippet(schema: &Value, cursor_count: usize) -> String {
             _ => format!("${cursor_count}"),
         },
         _ => format!("${cursor_count}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::hover::tests::complete_at;
+    use lsp_types::CompletionItemTag;
+    use serde_json::json;
+
+    fn labels(items: &[lsp_types::CompletionItem]) -> Vec<&str> {
+        items.iter().map(|item| item.label.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn value_completion_offers_each_example() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "port": { "type": "integer", "default": 8080, "examples": [80, 443] } }
+        });
+
+        let items = complete_at(schema, "port = \n", 7).await;
+
+        assert_eq!(labels(&items), ["8080", "80", "443"]);
+        assert_eq!(items[0].detail.as_deref(), Some("default"));
+        assert_eq!(items[1].detail.as_deref(), Some("example"));
+        assert_eq!(items[2].detail.as_deref(), Some("example"));
+    }
+
+    #[tokio::test]
+    async fn value_completion_never_repeats_a_label() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "on": { "type": "boolean", "default": true, "examples": [true, false] }
+            }
+        });
+
+        let items = complete_at(schema, "on = \n", 5).await;
+
+        assert_eq!(labels(&items), ["true", "false"]);
+    }
+
+    #[tokio::test]
+    async fn value_completion_skips_examples_beside_an_enum() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": { "enum": ["fast", "slow"], "examples": ["other"] }
+            }
+        });
+
+        let items = complete_at(schema, "mode = \n", 7).await;
+
+        assert_eq!(labels(&items), ["\"fast\"", "\"slow\""]);
+    }
+
+    #[tokio::test]
+    async fn value_completion_skips_examples_beside_a_const() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "mode": { "const": "only", "examples": ["other"] } }
+        });
+
+        let items = complete_at(schema, "mode = \n", 7).await;
+
+        assert_eq!(labels(&items), ["\"only\""]);
+    }
+
+    #[tokio::test]
+    async fn a_deprecated_key_is_tagged_in_entry_completion() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "old": { "type": "integer", "deprecated": true },
+                "new": { "type": "integer" }
+            }
+        });
+
+        let items = complete_at(schema, "\n", 0).await;
+
+        let old = items.iter().find(|item| item.label == "old").unwrap();
+        assert_eq!(old.tags.as_deref(), Some(&[CompletionItemTag::DEPRECATED][..]));
+        assert_eq!(old.deprecated, Some(true));
+
+        let new = items.iter().find(|item| item.label == "new").unwrap();
+        assert_eq!(new.tags, None);
+        assert_eq!(new.deprecated, None);
+    }
+
+    #[tokio::test]
+    async fn a_deprecated_table_is_tagged_in_header_completion() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "old": { "type": "object", "deprecated": true, "properties": {} }
+            }
+        });
+
+        // The header must be closed: `in_table_header` returns false without a
+        // `]`, and the request falls through to the standalone-key path.
+        let items = complete_at(schema, "[o]\n", 2).await;
+
+        let old = items.iter().find(|item| item.label == "old").unwrap();
+        assert_eq!(old.tags.as_deref(), Some(&[CompletionItemTag::DEPRECATED][..]));
+        assert_eq!(old.deprecated, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_deprecated_value_branch_tags_only_its_own_candidate() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "codec": {
+                    "oneOf": [
+                        { "const": "gzip", "deprecated": true },
+                        { "const": "zstd" }
+                    ]
+                }
+            }
+        });
+
+        let items = complete_at(schema, "codec = \n", 8).await;
+
+        let gzip = items.iter().find(|item| item.label == "\"gzip\"").unwrap();
+        assert_eq!(gzip.tags.as_deref(), Some(&[CompletionItemTag::DEPRECATED][..]));
+
+        let zstd = items.iter().find(|item| item.label == "\"zstd\"").unwrap();
+        assert_eq!(zstd.tags, None);
+    }
+
+    /// `Node`'s deserializer drops a null entry inside a table rather than
+    /// rejecting the whole value, so a default holding one still renders.
+    /// This records that behaviour, so rendering a default through a
+    /// deserialize-or-skip helper cannot silently change it.
+    #[tokio::test]
+    async fn a_default_holding_a_null_renders_with_that_entry_dropped() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "port": { "type": "integer", "default": { "a": null } } }
+        });
+
+        let values = complete_at(schema.clone(), "port = \n", 7).await;
+        assert_eq!(labels(&values), ["{  }"]);
+
+        let keys = complete_at(schema, "\n", 0).await;
+        assert_eq!(keys[0].insert_text.as_deref(), Some("port = ${0:{  }}"));
     }
 }

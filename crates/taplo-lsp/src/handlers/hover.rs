@@ -530,6 +530,36 @@ pub(crate) mod tests {
         }
     }
 
+    /// Returns the completion items the handler produces at a position on line 0.
+    pub(crate) async fn complete_at(
+        schema: serde_json::Value,
+        source: &str,
+        character: u32,
+    ) -> Vec<lsp_types::CompletionItem> {
+        let (world, document_url) = world_with(schema, source).await;
+
+        let response = crate::handlers::completion(
+            lsp_async_stub::Context::detached(world),
+            Some(lsp_types::CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: document_url },
+                    position: LspPosition::new(0, character),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .into(),
+        )
+        .await
+        .unwrap();
+
+        match response {
+            Some(lsp_types::CompletionResponse::Array(items)) => items,
+            other => panic!("expected an array of completion items, got {other:?}"),
+        }
+    }
+
     fn described(description: &str) -> serde_json::Value {
         json!({ "type": "integer", "description": description })
     }
