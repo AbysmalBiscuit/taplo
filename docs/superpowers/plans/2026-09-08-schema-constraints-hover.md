@@ -131,6 +131,17 @@ async fn key_hover_renders_numeric_exclusive_bounds() {
         .unwrap(),
         "- Range: `> 0`, `< 10`"
     );
+
+    assert_eq!(
+        key_hover_for(json!({
+            "type": "integer",
+            "exclusiveMinimum": 5,
+            "exclusiveMaximum": 5
+        }))
+        .await
+        .unwrap(),
+        "- Range: `> 5`, `< 5`"
+    );
 }
 
 #[tokio::test]
@@ -269,13 +280,13 @@ async fn key_hover_orders_constraints_between_values_and_access() {
 
 Run: `cargo test -p taplo-lsp --lib handlers::hover 2>&1 | tail -30`
 
-Expected: FAIL at runtime, not at compile time. Every test that unwraps panics with `called 'Option::unwrap()' on a 'None' value`, because no constraint keyword is read yet and a schema carrying only constraints renders nothing. `key_hover_ignores_a_boolean_exclusive_bound_with_no_neighbour`, `key_hover_ignores_numeric_keywords_of_the_wrong_shape` and `key_hover_drops_numeric_keywords_the_declared_type_makes_dead` pass already, because nothing reads those keywords yet; they are kept as regression cover. If the crate fails to compile instead, the failure is a typo in the test code rather than the behavior under test — fix it and re-run before continuing.
+Expected: FAIL at runtime, not at compile time. Every test that unwraps panics with `called 'Option::unwrap()' on a 'None' value`, because no constraint keyword is read yet and a schema carrying only constraints renders nothing. The one exception is `key_hover_orders_constraints_between_values_and_access`, whose schema also carries a description, a default and `readOnly`: it unwraps successfully and fails on the assertion, with the left side lacking the `- Range:` line. `key_hover_ignores_a_boolean_exclusive_bound_with_no_neighbour`, `key_hover_ignores_numeric_keywords_of_the_wrong_shape` and `key_hover_drops_numeric_keywords_the_declared_type_makes_dead` pass already, because nothing reads those keywords yet; they are kept as regression cover. If the crate fails to compile instead, the failure is a typo in the test code rather than the behavior under test — fix it and re-run before continuing.
 
 - [ ] **Step 3: Write the implementation**
 
 Add `use serde_json::{Number, Value};` in place of the existing `use serde_json::Value;` at the top of the file.
 
-Insert after `examples_fact` and before `schema_docs`:
+Insert after the closing brace of `examples_fact` and before the `/// The prose a schema offers for a key.` doc comment that introduces `schema_docs`:
 
 ```rust
 /// One end of a range: the bound and whether the schema excludes it.
@@ -420,8 +431,9 @@ so that a range costs one bullet rather than two. Both spellings of an
 exclusive bound are honored, told apart by shape rather than by a draft
 the renderer does not have.
 
-admits_type drops a keyword the declared type makes vacuous, which is
-what keeps the popup short as the remaining keyword groups land on it."
+admits_type drops a keyword the declared type makes vacuous, and
+bounds_fact renders any bounded pair; the string, array and object
+constraint groups land on both."
 ```
 
 ---
@@ -601,7 +613,7 @@ Expected: FAIL. `key_hover_renders_a_string_length` and its neighbours panic on 
 
 - [ ] **Step 3: Write the implementation**
 
-Insert after `multiple_of_fact` and before `admits_type`:
+Insert after the closing brace of `multiple_of_fact` and before the `/// Whether a schema's declared \`type\` admits instances of \`wanted\`` doc comment that introduces `admits_type`:
 
 ```rust
 /// Reads a keyword that bounds a size or a count, which no draft spells as
@@ -644,8 +656,12 @@ In `key_hover_sections`, insert after the `admits_type(schema, "number")` block:
             inclusive_bounds(schema, "minLength"),
             inclusive_bounds(schema, "maxLength"),
         ));
-        sections.facts.extend(string_fact(schema, "Pattern", "pattern"));
-        sections.facts.extend(string_fact(schema, "Format", "format"));
+        sections
+            .facts
+            .extend(string_fact(schema, "Pattern", "pattern"));
+        sections
+            .facts
+            .extend(string_fact(schema, "Format", "format"));
         sections
             .facts
             .extend(string_fact(schema, "Media type", "contentMediaType"));
@@ -864,6 +880,6 @@ git -C /home/lev/Git/lev/taplo-wt/schema-constraints-hover commit -m "feat(lsp):
 | 13 | `key_hover_renders_numeric_constraints_for_a_type_union`, `key_hover_renders_string_constraints_for_a_type_union`, `key_hover_renders_every_constraint_an_untyped_schema_writes` |
 | 14 | `key_hover_ignores_numeric_keywords_of_the_wrong_shape`, `key_hover_ignores_string_keywords_of_the_wrong_shape` |
 | 15 | `key_hover_renders_a_documented_string_key_as_five_bullets` |
-| 16 | The full check, run at the end of every task |
+| 16 | The full check, run at the end of every task. The CI-only commands (`cargo test -p taplo-common --features schema,reqwest,rustls-tls`, `git diff-index --quiet HEAD --`) touch nothing this plan changes and are inherited from `5a49d25`. |
 
 `key_hover_orders_constraints_between_values_and_access` and `key_hover_does_not_collapse_an_integer_against_a_float` carry no criterion number; the first pins the fact order the spec's "Facts" section states, and the second pins the `serde_json::Number` equality rule under "Bounds".
