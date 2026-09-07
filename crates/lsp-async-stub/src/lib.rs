@@ -184,6 +184,30 @@ impl<W: Clone> Context<W> {
         &self.world
     }
 
+    /// Builds a context that is not attached to a server.
+    ///
+    /// Messages written through it are discarded, so it serves handlers that
+    /// read the world and reply through their return value.
+    pub fn detached(world: W) -> Self {
+        Context {
+            inner: Arc::new(AsyncMutex::new(Inner {
+                next_request_id: 0,
+                initialized: true,
+                shutting_down: false,
+                handlers: HashMap::new(),
+                tasks: HashMap::new(),
+                requests: HashMap::new(),
+            })),
+            cancel_token: Cancellation::default().token(),
+            last_req_id: None,
+            rw: Arc::new(AsyncMutex::new(Box::new(
+                futures::sink::drain().sink_map_err(|never| match never {}),
+            ))),
+            world,
+            deferred: Default::default(),
+        }
+    }
+
     pub fn cancel_token(&mut self) -> &mut CancelToken {
         &mut self.cancel_token
     }
@@ -632,5 +656,16 @@ impl<P> Params<P> {
 impl<P> From<Option<P>> for Params<P> {
     fn from(p: Option<P>) -> Self {
         Self(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Context;
+
+    #[test]
+    fn a_detached_context_carries_its_world() {
+        let context = Context::detached(String::from("world"));
+        assert_eq!(context.world(), "world");
     }
 }
