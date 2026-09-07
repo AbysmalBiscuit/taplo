@@ -914,7 +914,10 @@ mod tests {
         let items = complete_at(schema, "\n", 0).await;
 
         let old = items.iter().find(|item| item.label == "old").unwrap();
-        assert_eq!(old.tags.as_deref(), Some(&[CompletionItemTag::DEPRECATED][..]));
+        assert_eq!(
+            old.tags.as_deref(),
+            Some(&[CompletionItemTag::DEPRECATED][..])
+        );
         assert_eq!(old.deprecated, Some(true));
 
         let new = items.iter().find(|item| item.label == "new").unwrap();
@@ -936,7 +939,10 @@ mod tests {
         let items = complete_at(schema, "[o]\n", 2).await;
 
         let old = items.iter().find(|item| item.label == "old").unwrap();
-        assert_eq!(old.tags.as_deref(), Some(&[CompletionItemTag::DEPRECATED][..]));
+        assert_eq!(
+            old.tags.as_deref(),
+            Some(&[CompletionItemTag::DEPRECATED][..])
+        );
         assert_eq!(old.deprecated, Some(true));
     }
 
@@ -957,7 +963,10 @@ mod tests {
         let items = complete_at(schema, "codec = \n", 8).await;
 
         let gzip = items.iter().find(|item| item.label == "\"gzip\"").unwrap();
-        assert_eq!(gzip.tags.as_deref(), Some(&[CompletionItemTag::DEPRECATED][..]));
+        assert_eq!(
+            gzip.tags.as_deref(),
+            Some(&[CompletionItemTag::DEPRECATED][..])
+        );
 
         let zstd = items.iter().find(|item| item.label == "\"zstd\"").unwrap();
         assert_eq!(zstd.tags, None);

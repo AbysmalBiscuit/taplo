@@ -414,11 +414,17 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
     sections.facts.extend(examples_fact(schema));
 
     if flag(schema, "readOnly") {
-        sections.facts.push(Fact { label: "Read-only", values: Vec::new() });
+        sections.facts.push(Fact {
+            label: "Read-only",
+            values: Vec::new(),
+        });
     }
 
     if flag(schema, "writeOnly") {
-        sections.facts.push(Fact { label: "Write-only", values: Vec::new() });
+        sections.facts.push(Fact {
+            label: "Write-only",
+            values: Vec::new(),
+        });
     }
 
     sections
@@ -607,8 +613,14 @@ pub(crate) mod tests {
     fn renders_facts_alone_as_a_bullet_list() {
         let sections = HoverSections {
             facts: vec![
-                Fact { label: "Default", values: vec!["1".into()] },
-                Fact { label: "Read-only", values: Vec::new() },
+                Fact {
+                    label: "Default",
+                    values: vec!["1".into()],
+                },
+                Fact {
+                    label: "Read-only",
+                    values: Vec::new(),
+                },
             ],
             ..Default::default()
         };
@@ -621,7 +633,10 @@ pub(crate) mod tests {
         let sections = HoverSections {
             banners: vec!["> **Deprecated**".into()],
             docs: Some("prose".into()),
-            facts: vec![Fact { label: "Default", values: vec!["1".into()] }],
+            facts: vec![Fact {
+                label: "Default",
+                values: vec!["1".into()],
+            }],
         };
 
         assert_eq!(
