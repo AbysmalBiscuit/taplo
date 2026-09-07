@@ -122,6 +122,8 @@ Facts are pushed in that order, after `Default` and `Examples` and before `Read-
 
 `Unique items` is the only constraint fact with no values, so it renders as a bare `- Unique items`; `render` already handles that case. `Items` and `Properties` name counts, which the comparison in the value makes unambiguous; `Unique items` beneath `Items` shares the noun on purpose.
 
+`Multiple of` reads `multipleOf` through `Value::as_number` and renders it through `serde_json::Number`'s `Display`, the same path a bound takes. Any other shape contributes nothing.
+
 ### Bounds
 
 A bounded pair renders as one fact whose values are the comparisons that apply:
@@ -145,6 +147,8 @@ Two spellings of an exclusive bound are honored, distinguished by shape rather t
 
 A schema may write both `minimum` and a numeric `exclusiveMinimum`, or both `maximum` and a numeric `exclusiveMaximum`. Every bound written renders, lower bounds before upper bounds and `minimum` before `exclusiveMinimum` within a side, so `{"minimum": 5, "exclusiveMinimum": 0}` is ``- Range: `>= 5`, `> 0` ``. Hover states the schema and does not compute the tighter bound, which would need numeric comparison across `u64`, `i64` and `f64` to answer a question the author already answered twice. The collapse applies only when each side carries exactly one bound.
 
+`bounds_fact` returns nothing when neither side carries a bound, so a schema whose only numeric keyword is a boolean `exclusiveMinimum` renders no `Range` line at all rather than a bare `- Range`.
+
 `declared_draft` classifies `Draft4` (`crates/taplo-common/src/schema/mod.rs:732`), so a draft-4 schema is one Taplo validates, and rendering `>= 1` for a schema that means `> 1` would be wrong rather than merely incomplete. The two forms cannot collide: draft 4 defines the keyword as a boolean and draft 6 onwards as a number, so the JSON type settles which was meant without consulting `$schema`. Under draft 6 and later `jsonschema` rejects a boolean in either keyword at compile time, so such a schema produces no diagnostics at all; hover still renders the exclusive bound, because that is what the author wrote.
 
 A `minimum` that is not a number, or an `exclusiveMinimum` that is neither a number nor a boolean, contributes nothing. Bounds render through `serde_json::Number`'s own `Display`, not through `f64`: an integer within `i64` or `u64` range is exact and carries no fractional part, a bound written with a fraction or an exponent renders in shortest round-trip form (`10.0`, and `1e2` as `100.0`), and an integer beyond `u64` range has already been read as a float by `serde_json` and renders as one.
@@ -161,7 +165,7 @@ A `minimum` that is not a number, or an `exclusiveMinimum` that is neither a num
 fn admits_type(schema: &Value, wanted: &str) -> bool
 ```
 
-`type` may be a string, an array of strings, or absent. An array matches when any member matches. `integer` counts as `number`, since the numeric keywords constrain both.
+`type` may be a string, an array of strings, or absent. An array matches when any string member matches; members that are not strings are ignored, and an array with no string member is a shape the specification does not describe and admits everything. `integer` counts as `number`, since the numeric keywords constrain both.
 
 The filter removes only what the keyword's own definition makes vacuous, which is why it needs no draft and why it is not in tension with rendering an unenforced `format`: `minLength` on an integer is dead by the definition of `minLength`, whereas `uri-template` under 2020-12 is live by the definition of `format` and unenforced only by this build of `jsonschema`. The same reasoning licenses nothing else. An annotation such as `default` carries no applicability condition and is never filtered; an implementation gap such as an uncompilable `pattern` is not a fact about the schema and is never filtered.
 
@@ -216,7 +220,7 @@ Five bullets for eight keywords, and the same schema with `type` removed adds no
 
 ### Shape of the code
 
-Ten contributors, four shared helpers, all in `hover.rs`:
+Ten contributors and five shared helpers, all in `hover.rs`:
 
 ```rust
 /// One end of a range: the bound and whether the schema excludes it.
@@ -224,19 +228,31 @@ struct Bound { value: Number, exclusive: bool }
 
 /// Renders the bounds on a quantity as one fact: `>= 1`, `<= 10`, or the bare
 /// bound when each side carries one inclusive bound and the two are equal,
-/// which is how a fixed size reads best.
+/// which is how a fixed size reads best. A side with no bound contributes no
+/// value, and two empty sides contribute no fact.
 fn bounds_fact(label: &'static str, lower: Vec<Bound>, upper: Vec<Bound>) -> Option<Fact>
+
+/// Reads one side of a numeric range, in the order the two keywords are
+/// written: the inclusive bound, then the bound spelled exclusive in its own
+/// right.
+fn numeric_bounds(schema: &Value, inclusive: &str, exclusive: &str) -> Vec<Bound>
 
 /// Reads a keyword that bounds a size or a count, which no draft spells as
 /// exclusive.
-fn inclusive_bound(schema: &Value, keyword: &str) -> Option<Bound>
+fn inclusive_bounds(schema: &Value, keyword: &str) -> Vec<Bound>
 
 /// A fact whose only value is a string the schema states verbatim, such as a
 /// regular expression or a format name.
 fn string_fact(schema: &Value, label: &'static str, keyword: &str) -> Option<Fact>
 ```
 
-`uniqueItems` reuses the existing `flag` helper, which counts only a literal `true`, matching `readOnly` and `writeOnly`. `key_hover_sections` gains four `if admits_type(...)` blocks, so the filter is visible at the call site rather than repeated inside each contributor.
+`numeric_bounds` exists so that the lower and upper sides of `Range` are read once rather than written twice inline; `Length`, `Items` and `Properties` reach `bounds_fact` through `inclusive_bounds`, whose result is a `Vec` of at most one so that every call site has the same shape.
+
+`string_fact` contributes nothing for an empty string. An empty `pattern` matches every string and constrains nothing, and an empty code span is not a code span in CommonMark, so the line would render as two literal backticks.
+
+`uniqueItems` and the draft-4 boolean both reuse the existing `flag` helper, which counts only a literal `true`, so `exclusiveMinimum: true` and `readOnly: true` share one definition of "written as `true`". `Bound` owns its `Number`, cloned out of `Value::as_number`, because `serde_json::Number` is not `Copy`.
+
+`key_hover_sections` gains four `if admits_type(...)` blocks, so the filter is visible at the call site rather than repeated inside each contributor.
 
 The doc comment on `Fact::values` changes from "Rendered TOML literals" to one that covers comparisons, regular expressions and format names as well, since those are not TOML.
 
@@ -258,14 +274,14 @@ Every criterion is asserted through the real `hover` handler unless it names a h
 4. `{"type": "integer", "multipleOf": 5}` is ``- Multiple of: `5` ``.
 5. `{"type": "integer", "minimum": 5, "exclusiveMinimum": 0}` is ``- Range: `>= 5`, `> 0` ``.
 6. `{"type": "string", "minLength": 1, "maxLength": 128}` is ``- Length: `>= 1`, `<= 128` ``, and `{"type": "string", "minLength": 40, "maxLength": 40}` collapses to ``- Length: `40` ``.
-7. `{"type": "string", "pattern": "^v\\d+$"}` is ``- Pattern: `^v\d+$` ``, and a pattern of ``a`b`` is fenced with a doubled backtick and padded, matching what `code_span` already does.
+7. `{"type": "string", "pattern": "^v\\d+$"}` is ``- Pattern: `^v\d+$` ``. A pattern of ``a`b`` widens the fence without padding, since `code_span` pads only a value that begins or ends with a backtick; a pattern of `` `x `` widens the fence and pads. An empty `pattern`, `format`, `contentMediaType` or `contentEncoding` contributes nothing.
 8. `{"type": "string", "format": "semver"}` is ``- Format: `semver` ``, and `format: "uri-template"` renders identically rather than being marked or dropped.
-9. `{"type": "string", "contentMediaType": "application/json", "contentEncoding": "base64"}` is ``- Media type: `application/json` `` followed by ``- Encoding: `base64` ``.
-10. `{"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true}` is ``- Items: `>= 1`, `<= 3` `` followed by `- Unique items`, and a `uniqueItems` that is `false` or not a boolean contributes nothing.
+9. `{"type": "string", "contentMediaType": "application/json", "contentEncoding": "base64"}` is ``- Media type: `application/json` `` and ``- Encoding: `base64` `` on consecutive lines, with no blank line between facts.
+10. `{"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true}` is ``- Items: `>= 1`, `<= 3` `` and `- Unique items` on consecutive lines, and a `uniqueItems` that is `false` or not a boolean contributes nothing.
 11. `{"type": "object", "minProperties": 1, "maxProperties": 5}` is ``- Properties: `>= 1`, `<= 5` ``.
-12. Every keyword written on a schema whose declared `type` it cannot constrain renders nothing: each of the seven schemas in the "dead keyword" table produces `None` from key hover, whatever the document holds.
+12. Every keyword written on a schema whose declared `type` it cannot constrain renders nothing: each of the seven schemas in the "dead keyword" table produces `None` from key hover on `port = 8080`.
 13. `{"type": ["string", "null"], "minLength": 1}` renders the length and `{"type": ["integer", "null"], "minimum": 1}` renders the range; a schema with no `type` that writes `minimum: 1`, `multipleOf: 2`, `minLength: 1`, `pattern: "^a$"`, `format: "email"`, `contentMediaType: "text/plain"`, `contentEncoding: "base64"`, `minItems: 1`, `uniqueItems: true` and `minProperties: 1` renders all ten facts in the order of the Facts table.
-14. A non-numeric `minimum`, a non-string `pattern` and a non-string `format` each contribute nothing.
+14. A non-numeric `minimum`, a non-numeric `multipleOf`, a non-string `pattern` and a non-string `format` each contribute nothing.
 15. The full worked example above renders exactly the five bullets shown, in that order, under its documentation.
 16. `cargo check --workspace --all-targets`, `cargo test --workspace` and `cargo check --target wasm32-unknown-unknown` from `crates/taplo-wasm` are clean, along with the CI command set in `.github/workflows/ci.yaml`: `cargo test -p taplo`; `cargo test -p taplo-common --features schema,reqwest,rustls-tls`; `cargo check`/`cargo test` for `-p lsp-async-stub -p taplo-common -p taplo-lsp -p taplo` and for `-p taplo-cli`; and `cargo run -- fmt --check` followed by a clean `git diff-index --quiet HEAD --`.
 
@@ -273,9 +289,9 @@ Every criterion is asserted through the real `hover` handler unless it names a h
 
 Three commits on `feat/schema-constraints-hover`, each building and passing on its own. This is one branch in a stack of five, so these are commits rather than separate pull requests; the branch opens one pull request.
 
-1. `feat(lsp): render numeric constraints in hover` — `Bound`, `bounds_fact`, `inclusive_bound`, `admits_type`, and the `Range` and `Multiple of` facts. The shared helpers land with the first facts that need them, and every branch of `bounds_fact` is asserted here: one-sided, two-sided, exclusive, doubled on one side, and the equal-inclusive collapse. The type filter is provable here too: `{"type": "string", "minimum": 1}` renders nothing. The commit body names `admits_type` as the helper the two following commits build on. Criteria 1 through 5, and the numeric rows of 12 through 14.
-2. `feat(lsp): render string constraints in hover` — `string_fact`, and the `Length`, `Pattern`, `Format`, `Media type` and `Encoding` facts. Criteria 6 through 9 and 15.
-3. `feat(lsp): render array and object constraints` — `Items`, `Unique items` and `Properties`. Criteria 10, 11, and the remaining rows of 12 and 13.
+1. `feat(lsp): render numeric constraints in hover` — `Bound`, `bounds_fact`, `numeric_bounds`, `admits_type`, and the `Range` and `Multiple of` facts. Every helper lands with a caller, and every branch of `bounds_fact` is asserted here: one-sided, two-sided, exclusive, doubled on one side, the equal-inclusive collapse, and no bounds at all. The type filter is provable here too: `{"type": "string", "minimum": 1}` renders nothing. The commit body names `admits_type` and `bounds_fact` as the helpers the two following commits build on. Criteria 1 through 5, and the numeric rows of 12 through 14.
+2. `feat(lsp): render string constraints in hover` — `inclusive_bounds`, `string_fact`, and the `Length`, `Pattern`, `Format`, `Media type` and `Encoding` facts. `inclusive_bounds` lands here because `Length` is its first caller. Criteria 6 through 9, 15, and the string rows of 12 through 14.
+3. `feat(lsp): render array and object constraints` — `Items`, `Unique items` and `Properties`. Criteria 10, 11, and the array and object rows of 12 and 13.
 
 The split is by constrained type because that is the boundary a reviewer can reject one side of: the argument about `format` and the argument about the draft-4 `exclusiveMinimum` are in different commits and share no code beyond helpers that commit 1 justifies on its own. Each commit's test set is self-contained.
 
