@@ -7,7 +7,7 @@
 
 JSON Schema's annotation keywords carry no constraints. Their only purpose is to reach a human, and the only place a Taplo user meets a schema is hover text and completion items. Taplo reads none of them.
 
-`rg -n "examples|deprecated|readOnly|writeOnly|markdownDescription" crates/taplo-lsp/src/handlers/` returns nothing. Four keywords are dropped:
+`rg -n '"(examples|deprecated|readOnly|writeOnly|markdownDescription)"' crates/taplo-lsp/src/handlers/` returns nothing. (The unanchored pattern matches `deprecated: None` in `document_symbols.rs`, which is a `SymbolInformation` field, not a schema read.) Four keywords are dropped:
 
 | Keyword | Since | What a user loses |
 |---|---|---|
@@ -93,7 +93,16 @@ struct HoverSections {
     /// Prose documentation for the key.
     docs: Option<String>,
     /// One line per keyword that carries a concrete value or constraint.
-    facts: Vec<String>,
+    facts: Vec<Fact>,
+}
+
+/// A labelled hover line: `Default` with one value, `Examples` with several,
+/// `Read-only` with none.
+struct Fact {
+    label: &'static str,
+    /// Rendered TOML literals. `render` fences each as a code span, so a
+    /// contributor never writes a backtick.
+    values: Vec<String>,
 }
 ```
 
@@ -123,21 +132,24 @@ Mapping for this feature set:
 | `readOnly: true` | fact | `Read-only` |
 | `writeOnly: true` | fact | `Write-only` |
 
+A `Fact` with no values renders as `- {label}`; with values, as `- {label}: ` followed by the values as code spans joined with `, `. So `Fact { label: "Default", values: vec!["8080"] }` renders `- Default: `8080`` and `Fact { label: "Read-only", values: vec![] }` renders `- Read-only`.
+
 Banner order is link first, then the deprecation notice, which preserves the current position of the link. Facts render in push order: values (`Default`, `Examples`) first, then access (`Read-only`, `Write-only`). Constraint facts are appended after these.
 
-Every fact that quotes a value fences it through a shared helper rather than bare backticks:
+Fencing lives in `render`, not in the contributors:
 
 ```rust
 /// Wraps a rendered value in a markdown code span, widening the fence past any
-/// backtick run inside it.
+/// backtick run inside the value and padding with spaces when it begins or ends
+/// with a backtick.
 fn code_span(text: &str) -> String
 ```
 
-`default_value_markdown` uses single backticks today, which a value containing a backtick breaks. `examples` widens that exposure and the next feature set's `pattern` makes it routine.
+`default_value_markdown` builds its own single-backtick span today, which a value containing a backtick breaks. Putting the fence in `render` means no contributor can forget it, which matters because the next feature set's `pattern` carries author-written regexes where backticks are ordinary.
 
-The next feature set extends this by pushing onto `facts`: one line per constraint (``Minimum: `0` ``, ``Pattern: `^v\d+$` ``, `Unique items`). Paired keywords (`minimum`/`maximum`, `minLength`/`maxLength`, `minItems`/`maxItems`, `minProperties`/`maxProperties`, with `exclusiveMinimum`/`exclusiveMaximum` folding into the range line) are paired by the contributor pushing one combined string, which `Vec<String>` already allows. It adds contributors; it does not touch `render` or the handler.
+That feature set extends this by pushing `Fact`s: `Fact { label: "Minimum", values: vec!["0"] }`, `Fact { label: "Pattern", values: vec![r"^v\d+$"] }`, `Fact { label: "Unique items", values: vec![] }`. A paired keyword either pushes one `Fact` with two values or two `Fact`s, its choice. Deciding how several constraints render together — the open item in the tracking issue's constraints section — is then a change to `render` alone, which is the point of holding layout there rather than in each contributor.
 
-`default` moves from a paragraph to a bullet. The string `default_value_markdown` returns is unchanged, so its unit test stands; only the `- ` prefix `render` adds is new.
+`default` moves from a paragraph to a bullet, and `default_value_markdown` becomes a `Fact` contributor returning `Fact { label: "Default", values: vec![node.to_toml(true, false)] }` rather than a formatted string. Its unit test is rewritten against the new return type in the same commit.
 
 ### Documentation precedence
 
@@ -177,8 +189,12 @@ In `add_value_completions` the examples are pushed after the `default` candidate
 
 Two suppressions:
 
-- `enum` and `const` return early from `add_value_completions` before `default` is reached. `examples` inherits that: a schema that enumerates its allowed values has already said everything, and examples would duplicate or contradict it.
-- An example whose rendered label equals the label of an item already pushed for the same schema is skipped, so neither the default nor a repeated example produces a duplicate.
+- `enum` and `const` return early from `add_value_completions` (lines 513 and 545) before `default` at 548 is reached. `examples` inherits that: a schema that enumerates its allowed values has already said everything, and examples would duplicate or contradict it.
+- Within one call, an item whose label equals the label of an item already pushed for that schema is skipped. The rule applies to the `default` item, the example items and the type-shaped literals alike, not only to examples against the default.
+
+The second rule is deliberately wider than `examples` needs, because the narrow version is broken. Examples are pushed before the type literals, so `{"type": "boolean", "examples": [true]}` would push `true` from `examples` and `true` again from the boolean arm at line 606. `{"type": "boolean", "default": true}` already duplicates today for exactly that reason. Deduplicating on the rendered label at the point of push fixes both and is the only rule that stays correct as the type arms grow.
+
+Deduplication is per schema, not across the whole response: two `anyOf` branches that both allow `true` are two schemas, and merging their items is a separate question about `possible_schemas_from` that this spec does not open.
 
 Documentation on an example item is the schema's docs, matching what the `default` item falls back to.
 
@@ -198,13 +214,21 @@ fn schema_annotated_item(schema: &Value) -> CompletionItem
 
 Call sites change from `..Default::default()` to `..schema_annotated_item(&…)` and drop their `documentation` line. After the change, `rg -n 'documentation\(&' crates/taplo-lsp/src/handlers/completion.rs` matches only inside the helper.
 
-Value completion items are not tagged. `deprecated` sits on the key's schema, and by the time a user is choosing a value the key is already written; tagging every candidate for it repeats a signal they cannot act on there.
+Value completion items are tagged on the same rule: every item `add_value_completions` pushes for a schema carries the tag when that schema says `deprecated: true`. This is not the key's deprecation leaking into the value list. `add_value_completions` runs once per schema applying at the position (`completion.rs:370-377`), and `collect_schemas` descends into each `oneOf` and `anyOf` branch, so a schema written as
+
+```json
+{"oneOf": [{"const": "gzip", "deprecated": true}, {"const": "zstd"}]}
+```
+
+produces one call per branch, and the `const` item for `gzip` is built from exactly the subschema that declares the deprecation. Deprecating one allowed value by putting `deprecated` on its branch is the standard shape, and it is the only shape in which a value-level tag is meaningful — `enum` members carry no per-member schema. Reading the keyword off whichever schema built the item covers it without a special case.
 
 ### Which hover branch
 
 `hover.rs` has two branches. The `IDENT` branch describes a key and is where `default` already renders; it gets the full `HoverSections` treatment.
 
-The primitive branch describes one written value, and its whole shape is a single docs string selected by matching the value against `enum`, `default` and `const`, with per-schema strings joined by a single newline. It gets the documentation precedence change and nothing else. A banner cannot be bolted onto that shape: `> **Deprecated**` followed by a newline and prose is a blockquote with a lazy continuation, so the docs would render inside the quote. Fixing that means giving the branch its own sections value, blank-line join and empty filter, which is the rewrite this spec confines to the key branch. Deprecation, `Read-only` and `Write-only` are properties of the key, and the key hover on the same line already says them. When the value branch grows sections it takes all of them at once, constraint keywords included. Its single-newline join is pre-existing and unchanged here.
+The primitive branch describes one written value, and its whole shape is a single docs string selected by matching the value against `enum`, `default` and `const`, with per-schema strings joined by a single newline. It gets the documentation precedence change and nothing else. A banner cannot be bolted onto that shape: `> **Deprecated**` followed by a newline and prose is a blockquote with a lazy continuation, so the docs would render inside the quote. Fixing that means giving the branch its own sections value, blank-line join and empty filter, which is the rewrite this spec confines to the key branch. The key hover on the same line already carries every annotation, so nothing is unreachable. When the value branch grows sections it takes all of them at once, constraint keywords included. Its single-newline join is pre-existing and unchanged here.
+
+Key hover renders one section per applicable schema, so a `oneOf` branch carrying `deprecated: true` shows its banner inside that branch's section rather than at the top of the popup. The `---` separator is what keeps a deprecated branch from reading as a deprecated key.
 
 ### Testing at the handler
 
@@ -216,7 +240,9 @@ The function is ordinary public API: it is a constructor for a type the crate al
 
 With it, a test in `taplo-lsp` builds a `WorldState<NativeEnvironment>`, seeds the schema cache through `ws.schemas.cache().store(...)`, adds a glob `SchemaAssociation`, inserts a `DocumentState`, and calls the handler. No network, no server, no `initialize` handshake. `WorldState::new` seeds a default workspace at `root:///` that `by_document` falls back to, and `SchemaConfig::enabled` defaults true, so no configuration is needed. Verified: the probe table under "Problem" was produced this way.
 
-`taplo-lsp` has no `[dev-dependencies]`; the handlers are async, so `tokio = { workspace = true, features = ["macros", "rt"] }` is added, matching `taplo-common`. That is the only dependency addition.
+Two details the fixture must get right. `Cache::store` inserts into the in-memory LRU and then returns `Err("cache path not set")` when no disk path is configured (`cache.rs:88-91`), so the test discards its result rather than unwrapping — the schema is cached regardless. And `NativeEnvironment::new()` calls `Handle::current()` (`native.rs:18`), so it panics outside a runtime; that is why the tests must be `#[tokio::test]` rather than plain `#[test]`, not merely a convenience for awaiting the handler.
+
+`taplo-lsp` has no `[dev-dependencies]`; the handlers are async, so `tokio = { workspace = true, features = ["macros", "rt"] }` is added, matching `taplo-common`. That is the only dependency addition. CI runs `taplo fmt --check` over `**/*.toml`, and `taplo.toml` applies `align_entries` and `reorder_keys` to `*-dependencies`, so the new table must be formatted to match or the `git diff-index --quiet` step fails.
 
 ## Behavior changes to accept
 
@@ -243,22 +269,25 @@ Every criterion is asserted through the real `hover` or `completion` handler unl
 3. Key hover on `readOnly: true` contains `- Read-only`; on `writeOnly: true`, `- Write-only`; a schema with both contains both.
 4. Key hover on a schema carrying both `markdownDescription` and `description` shows the `markdownDescription`. A schema carrying `x-taplo.docs.main` as well shows the `x-taplo` text. A schema carrying only `description` is unchanged.
 5. Value hover follows the same precedence, and still falls back to `title` when none of the three is present.
-6. Completion in a value position offers one item per `examples` entry with `detail: Some("example")`, the `default` item carries `detail: Some("default")`, and no two items share a label. A schema with `enum` or `const` offers no example items.
-7. A key completion item for a `deprecated: true` schema carries `tags: Some(vec![CompletionItemTag::DEPRECATED])` and `deprecated: Some(true)`; one for a schema without it carries `None` in both. Asserted at a table-header position and at an entry-key position, and `rg -n 'documentation\(&' crates/taplo-lsp/src/handlers/completion.rs` matches only inside `schema_annotated_item`.
-8. Key completion documentation follows the same precedence as criterion 4.
-9. Key hover over an `anyOf` of two described branches contains exactly one `---` and no trailing separator.
-10. `HoverSections::render` has unit tests for the empty value, docs-only, facts-only, and all-sections cases, and `code_span` has one for a value containing a backtick.
-11. The CI command set passes: `cargo test -p taplo`; `cargo test -p taplo-common --features schema,reqwest,rustls-tls`; `cargo check -p lsp-async-stub -p taplo-common -p taplo-lsp -p taplo` and the matching `cargo test`; `cargo check -p taplo-cli` and `cargo test -p taplo-cli`; and `cargo check --target wasm32-unknown-unknown` from `crates/taplo-wasm`. The wasm check matters because commit 1 touches `lsp-async-stub`; `Context::detached` uses only `futures`, which that build already compiles. `cargo check --workspace --all-targets` and `cargo test --workspace` also pass.
+6. Completion in a value position offers one item per `examples` entry with `detail: Some("example")`, and the `default` item carries `detail: Some("default")`. A schema with `enum` or `const` offers no example items.
+7. No two items in one value-completion response for a single schema share a label. Asserted on `{"type": "boolean", "default": true, "examples": [true, false]}`, which yields exactly two items.
+8. A key completion item for a `deprecated: true` schema carries `tags: Some(vec![CompletionItemTag::DEPRECATED])` and `deprecated: Some(true)`; one for a schema without it carries `None` in both. Asserted at a table-header position and at an entry-key position, and `rg -n 'documentation\(&' crates/taplo-lsp/src/handlers/completion.rs` matches only inside `schema_annotated_item`.
+9. A value-completion item built from a `oneOf` branch carrying `deprecated: true` carries both fields; the item from its sibling branch carries `None` in both.
+10. Key completion and value completion on a schema with `default: {"a": null}` both return `Some` without panicking, and offer no item for that default.
+11. Key completion documentation follows the same precedence as criterion 4.
+12. Key hover over an `anyOf` of two described branches contains exactly one `---` and no trailing separator.
+13. `HoverSections::render` has unit tests for the empty value, docs-only, facts-only, and all-sections cases; a `Fact` with no values renders without a colon; and `code_span` has tests for a value containing a backtick run and for one that begins with a backtick.
+14. The CI command set passes: `cargo test -p taplo`; `cargo test -p taplo-common --features schema,reqwest,rustls-tls`; `cargo check -p lsp-async-stub -p taplo-common -p taplo-lsp -p taplo` and the matching `cargo test`; `cargo check -p taplo-cli` and `cargo test -p taplo-cli`; `cargo check --target wasm32-unknown-unknown` from `crates/taplo-wasm`; and `cargo run -p taplo-cli -- fmt --check` followed by a clean `git status`. The wasm check matters because commit 1 touches `lsp-async-stub`; `Context::detached` uses only `futures`, which that build already compiles. The formatting check matters because commit 2 adds a `[dev-dependencies]` table. `cargo check --workspace --all-targets` and `cargo test --workspace` also pass.
 
 ## Landing
 
 Five commits, each building and passing the CI command set on its own. This is one branch in a stack of five, so these are commits rather than separate pull requests; the branch opens one pull request.
 
-1. `test(lsp): drive hover and completion from tests` — `Context::detached`, the `tokio` dev-dependency, and the shared test fixture, with tests asserting today's hover and completion output. Nothing user-visible changes. This lands first because every later commit's test depends on it, and it is the only commit that touches `lsp-async-stub`. Its assertions on hover text are rewritten by commit 2, which is the point: they are the characterization that makes commit 2's diff legible, not a durable contract.
-2. `feat(lsp): structure hover content as sections` — `HoverSections`, `render`, `code_span`, the `---` separator and the empty-schema filter, with `default` moved onto the facts list. Criteria 9 and 10, and the first three rendering changes under "Behavior changes to accept".
-3. `feat(lsp): prefer markdownDescription over description` — the precedence change at all four sites, plus the `developing-schemas.md` correction. Criteria 4, 5 and 8.
+1. `feat(lsp-async-stub): add detached context constructor` — `Context::detached` alone. It is an API addition to a published crate and gets a commit that says so; burying it under a `test:` subject hides a public-surface change from anyone reading the log. Nothing else in the workspace changes.
+2. `feat(lsp): structure hover content as sections` — the `tokio` dev-dependency, the shared test fixture, `HoverSections`, `Fact`, `render`, `code_span`, the `---` separator and the empty-schema filter, with `default` moved onto the facts list. Criteria 12 and 13, and the first three rendering changes under "Behavior changes to accept". The fixture lands here rather than in its own commit so that the tests arrive with the behavior they assert, instead of asserting output that the next commit immediately rewrites.
+3. `feat(lsp): prefer markdownDescription over description` — the precedence change at all four sites, plus the `developing-schemas.md` correction. Criteria 4, 5 and 11.
 4. `feat(lsp): render annotation keywords in hover` — `examples`, `deprecated`, `readOnly`, `writeOnly` as banner and fact contributors. Criteria 1, 2 and 3.
-5. `feat(lsp): annotate completions from the schema` — example value candidates with `detail`, the shared deserialize-or-skip helper replacing the four `unwrap`s, and `schema_annotated_item` across the six key sites. Criteria 6 and 7.
+5. `feat(lsp): annotate completions from the schema` — example value candidates with `detail`, the shared deserialize-or-skip helper replacing the four `unwrap`s, label deduplication, and `schema_annotated_item` across the six key sites. Criteria 6 through 10.
 
 Commit 2 lands before 3, 4 and 5 because they add contributors to the structure it introduces. Commit 3 is separable because it changes existing output rather than adding to it, and is the one most likely to be argued with. Commits 4 and 5 split hover from completion: they share no code beyond the keyword reads, and a reviewer can reject one while approving the other.
 
