@@ -198,7 +198,9 @@ Deduplication is per schema, not across the whole response: two `anyOf` branches
 
 Documentation on an example item is the schema's docs, matching what the `default` item falls back to.
 
-The same deserialize-or-skip helper replaces the four `serde_json::from_value(...).unwrap()` calls on `const` and `default` at `completion.rs` 518, 550, 693 and 700. A `default` the `Node` deserializer rejects currently panics the completion handler, and leaving two `unwrap`s beside a new `continue` on the same values is incoherent.
+The same deserialize-or-skip helper replaces the four `serde_json::from_value(...).unwrap()` calls on `const` and `default` at `completion.rs` 518, 550, 693 and 700, and the `!is_null()` guards that precede them.
+
+Those `unwrap`s are not currently reachable, and the replacement is a simplification rather than a bug fix. A top-level `null` is the only value `Node`'s deserializer rejects, and every one of the four sites already guards against exactly that. A null *inside* a default is not rejected: `visit_map` and `visit_seq` log the offending entry and continue (`crates/taplo/src/dom/serde.rs:198-208` and `:236-244`), so `{"a": null}` deserializes to an empty table. `examples` needs deserialize-or-skip because its elements carry no such guard, and leaving two `unwrap`s beside a new `continue` over the same kind of value would be incoherent.
 
 ### `deprecated` in completion
 
@@ -273,7 +275,7 @@ Every criterion is asserted through the real `hover` or `completion` handler unl
 7. No two items in one value-completion response for a single schema share a label. Asserted on `{"type": "boolean", "default": true, "examples": [true, false]}`, which yields exactly two items.
 8. A key completion item for a `deprecated: true` schema carries `tags: Some(vec![CompletionItemTag::DEPRECATED])` and `deprecated: Some(true)`; one for a schema without it carries `None` in both. Asserted at a table-header position and at an entry-key position, and `rg -n 'documentation\(&' crates/taplo-lsp/src/handlers/completion.rs` matches only inside `schema_annotated_item`.
 9. A value-completion item built from a `oneOf` branch carrying `deprecated: true` carries both fields; the item from its sibling branch carries `None` in both.
-10. Key completion and value completion on a schema with `default: {"a": null}` both return `Some` without panicking, and offer no item for that default.
+10. A `default` holding a null entry, such as `{"a": null}`, renders with that entry dropped rather than failing: value completion offers `{  }`, and the key-completion snippet is `port = ${0:{  }}`. This records what `Node`'s deserializer already does, so the shared helper cannot be mistaken for a behavior change.
 11. Key completion documentation follows the same precedence as criterion 4.
 12. Key hover over an `anyOf` of two described branches contains exactly one `---` and no trailing separator.
 13. `HoverSections::render` has unit tests for the empty value, docs-only, facts-only, and all-sections cases; a `Fact` with no values renders without a colon; and `code_span` has tests for a value containing a backtick run and for one that begins with a backtick.

@@ -20,6 +20,7 @@
 - Documentation precedence everywhere: `x-taplo.docs.main` > `markdownDescription` > `description`.
 - After any edit to a `.toml` file, run `cargo run -p taplo-cli -- fmt` from the worktree root. CI runs `taplo fmt --check` over `**/*.toml` and then `git diff-index --quiet`.
 - Every task ends with a commit. Do not push, do not open a pull request.
+- The wasm check needs its target installed once per machine: `rustup target add wasm32-unknown-unknown`. Without it the check fails with `error[E0463]: can't find crate for 'core'`, which is a missing toolchain component, not a code defect.
 
 **Verification command set** (referred to below as "the full check"):
 
@@ -834,7 +835,7 @@ Add to `hover.rs`'s `mod tests`:
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p taplo-lsp`
-Expected: FAIL — the assertions return `None` or text without the new lines, because no contributor reads the keywords yet.
+Expected: five of the seven new tests FAIL, returning `None` or text without the new lines, because no contributor reads the keywords yet. `key_hover_ignores_a_non_array_examples` and `key_hover_ignores_a_deprecated_that_is_not_true` assert today's behaviour and pass immediately; that is correct, they guard against over-eager reads in Step 3.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1059,7 +1060,9 @@ mod tests {
             }
         });
 
-        let items = complete_at(schema, "[\n", 1).await;
+        // The header must be closed: `in_table_header` returns false without a
+        // `]`, and the request falls through to the standalone-key path.
+        let items = complete_at(schema, "[o]\n", 2).await;
 
         let old = items.iter().find(|item| item.label == "old").unwrap();
         assert_eq!(old.tags.as_deref(), Some(&[CompletionItemTag::DEPRECATED][..]));
@@ -1089,17 +1092,22 @@ mod tests {
         assert_eq!(zstd.tags, None);
     }
 
+    /// `Node`'s deserializer drops a null entry inside a table rather than
+    /// rejecting the whole value, so a default holding one still renders.
+    /// This records that behaviour, so replacing the `unwrap`s with
+    /// `toml_literal` cannot silently change it. It passes before Step 3.
     #[tokio::test]
-    async fn a_default_that_is_not_a_toml_value_does_not_panic() {
+    async fn a_default_holding_a_null_renders_with_that_entry_dropped() {
         let schema = json!({
             "type": "object",
             "properties": { "port": { "type": "integer", "default": { "a": null } } }
         });
 
         let values = complete_at(schema.clone(), "port = \n", 7).await;
-        assert!(labels(&values).iter().all(|label| *label != "{ a = }"));
+        assert_eq!(labels(&values), ["{  }"]);
 
-        complete_at(schema, "\n", 0).await;
+        let keys = complete_at(schema, "\n", 0).await;
+        assert_eq!(keys[0].insert_text.as_deref(), Some("port = ${0:{  }}"));
     }
 }
 ```
@@ -1109,7 +1117,7 @@ Register the module import in `completion.rs`'s header if needed; `super::super:
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p taplo-lsp`
-Expected: FAIL — no `detail`, no tags, and duplicate labels.
+Expected: seven of the nine new tests FAIL — no `detail`, no tags, and duplicate labels. `value_completion_skips_examples_beside_an_enum` and `..._a_const` pass immediately, because the early returns they rely on already exist; they guard against Step 3 pushing examples past them. `a_default_holding_a_null_renders_with_that_entry_dropped` also passes immediately by design — it is a characterisation test, not a RED one.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1225,7 +1233,40 @@ Rewrite the `const` block (lines 516-546) as:
 
 The old block chose `kind` by whether the node was a table; `toml_literal` no longer returns the node, and every `const` a TOML document can hold renders as a value, so `CompletionItemKind::VALUE` is used throughout.
 
-Rewrite the `default` block (lines 548-575) the same way with `detail: Some("default".into())` and `ext_docs.default_value`, then append the examples immediately after it:
+Rewrite the `default` block (lines 548-575) as follows. Unlike the `const` block it does **not** end in a `return`: the examples and the type arms below it must still run.
+
+```rust
+    if let Some(default_value) = schema.get("default") {
+        if let Some(toml_value) = toml_literal(default_value, single_quote) {
+            completions.push(CompletionItem {
+                label: toml_value.clone(),
+                detail: Some("default".into()),
+                kind: Some(CompletionItemKind::VALUE),
+                documentation: ext_docs
+                    .default_value
+                    .clone()
+                    .or_else(|| schema_docs.clone())
+                    .map(|value| {
+                        Documentation::MarkupContent(MarkupContent {
+                            kind: lsp_types::MarkupKind::Markdown,
+                            value,
+                        })
+                    }),
+                tags: deprecated.then(|| vec![CompletionItemTag::DEPRECATED]),
+                deprecated: deprecated.then_some(true),
+                text_edit: range.map(|range| {
+                    CompletionTextEdit::Edit(TextEdit {
+                        range,
+                        new_text: toml_value,
+                    })
+                }),
+                ..Default::default()
+            });
+        }
+    }
+```
+
+Then append the examples immediately after it:
 
 ```rust
     if let Some(examples) = schema["examples"].as_array() {
@@ -1283,8 +1324,8 @@ Expected: PASS.
 
 - [ ] **Step 5: Verify no key-completion site was missed**
 
-Run: `rg -n 'documentation\(&' /home/lev/Git/lev/taplo-wt/schema-annotations/crates/taplo-lsp/src/handlers/completion.rs`
-Expected: exactly one match, inside `schema_annotated_item`.
+Run: `rg -n 'documentation\(' /home/lev/Git/lev/taplo-wt/schema-annotations/crates/taplo-lsp/src/handlers/completion.rs`
+Expected: exactly two matches — the `fn documentation(schema: &Value)` definition, and the `documentation: documentation(schema),` line inside `schema_annotated_item`. No match inside any `.map(|(…)| CompletionItem { … })` closure; each of those now spreads `..schema_annotated_item(&…)` instead.
 
 - [ ] **Step 6: Run the full check**
 
@@ -1312,7 +1353,7 @@ git -C /home/lev/Git/lev/taplo-wt/schema-annotations commit -m "feat(lsp): annot
 | 7 no repeated labels | 5 |
 | 8 deprecation tag on key completions | 5 |
 | 9 deprecation tag on a value branch | 5 |
-| 10 a null-bearing default does not panic | 5 |
+| 10 a null-bearing default renders with the entry dropped | 5 |
 | 11 key completion documentation precedence | 3 |
 | 12 one `---`, no trailing separator | 2 |
 | 13 `render` and `code_span` unit tests | 2 |
