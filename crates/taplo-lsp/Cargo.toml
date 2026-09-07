@@ -44,3 +44,6 @@ tracing     = { workspace = true }
 
 [package.metadata.auto-tag]
 enabled = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

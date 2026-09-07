@@ -130,36 +130,9 @@ pub(crate) async fn hover<E: Environment>(
 
             let content = schemas
                 .iter()
-                .map(|(_, schema)| {
-                    let ext = schema_ext_of(schema).unwrap_or_default();
-                    let ext_docs = ext.docs.unwrap_or_default();
-                    let ext_links = ext.links.unwrap_or_default();
-
-                    let mut s = String::new();
-                    if let Some(docs) = ext_docs.main {
-                        s += &docs;
-                    } else if let Some(desc) = schema["description"].as_str() {
-                        s += desc;
-                    }
-
-                    if let Some(default) = default_value_markdown(schema) {
-                        if !s.is_empty() {
-                            s += "\n\n";
-                        }
-                        s += &default;
-                    }
-
-                    let link_title = schema["title"].as_str().unwrap_or("...");
-
-                    if links_in_hover {
-                        if let Some(link) = &ext_links.key {
-                            s = format!("[{link_title}]({link})\n\n{s}");
-                        }
-                    }
-
-                    s
-                })
-                .join("\n\n");
+                .map(|(_, schema)| key_hover_sections(schema, links_in_hover).render())
+                .filter(|rendered| !rendered.is_empty())
+                .join("\n\n---\n\n");
 
             if content.is_empty() {
                 return Ok(None);
@@ -283,10 +256,82 @@ pub(crate) async fn hover<E: Environment>(
     Ok(None)
 }
 
+/// A labelled hover line: `Default` with one value, `Examples` with several,
+/// `Read-only` with none.
+struct Fact {
+    label: &'static str,
+    /// Rendered TOML literals. `HoverSections::render` fences each as a code
+    /// span, so a contributor never writes a backtick itself.
+    values: Vec<String>,
+}
+
+/// One schema's hover text, assembled from independent contributors so that a
+/// keyword with nothing to say adds no separator.
+#[derive(Default)]
+struct HoverSections {
+    /// Whole-key notices, rendered above the documentation.
+    banners: Vec<String>,
+    /// Prose documentation for the key.
+    docs: Option<String>,
+    /// One line per keyword that carries a concrete value or constraint.
+    facts: Vec<Fact>,
+}
+
+impl HoverSections {
+    fn render(&self) -> String {
+        let mut blocks: Vec<String> = self.banners.clone();
+
+        blocks.extend(self.docs.clone());
+
+        if !self.facts.is_empty() {
+            blocks.push(
+                self.facts
+                    .iter()
+                    .map(|fact| {
+                        if fact.values.is_empty() {
+                            format!("- {}", fact.label)
+                        } else {
+                            format!(
+                                "- {}: {}",
+                                fact.label,
+                                fact.values.iter().map(|v| code_span(v)).join(", ")
+                            )
+                        }
+                    })
+                    .join("\n"),
+            );
+        }
+
+        blocks.retain(|block| !block.is_empty());
+        blocks.join("\n\n")
+    }
+}
+
+/// Wraps a value in a markdown code span wide enough to contain it.
+///
+/// A span's fence must be longer than any backtick run inside it, and a value
+/// that begins or ends with a backtick needs a space on each side so the fence
+/// is not absorbed into the content.
+fn code_span(text: &str) -> String {
+    let longest_run = text
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+
+    let fence = "`".repeat(longest_run + 1);
+
+    if text.starts_with('`') || text.ends_with('`') {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
+    }
+}
+
 /// Renders a schema's `default` as a TOML literal, so that hovering a key shows
 /// the value the tool falls back to. `x-taplo.docs.defaultValue` documents the
 /// same keyword in prose and is rendered separately.
-fn default_value_markdown(schema: &Value) -> Option<String> {
+fn default_fact(schema: &Value) -> Option<Fact> {
     let default = schema.get("default")?;
 
     if default.is_null() {
@@ -295,7 +340,34 @@ fn default_value_markdown(schema: &Value) -> Option<String> {
 
     let node: Node = serde_json::from_value(default.clone()).ok()?;
 
-    Some(format!("Default: `{}`", node.to_toml(true, false)))
+    Some(Fact {
+        label: "Default",
+        values: vec![node.to_toml(true, false)],
+    })
+}
+
+/// Collects everything hover shows for a key from one schema.
+fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
+    let ext = schema_ext_of(schema).unwrap_or_default();
+    let ext_docs = ext.docs.unwrap_or_default();
+    let ext_links = ext.links.unwrap_or_default();
+
+    let mut sections = HoverSections::default();
+
+    if links_in_hover {
+        if let Some(link) = &ext_links.key {
+            let link_title = schema["title"].as_str().unwrap_or("...");
+            sections.banners.push(format!("[{link_title}]({link})"));
+        }
+    }
+
+    sections.docs = ext_docs
+        .main
+        .or_else(|| schema["description"].as_str().map(Into::into));
+
+    sections.facts.extend(default_fact(schema));
+
+    sections
 }
 
 fn is_primitive(kind: SyntaxKind) -> bool {
@@ -317,29 +389,205 @@ fn is_primitive(kind: SyntaxKind) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::default_value_markdown;
+pub(crate) mod tests {
+    use super::*;
+    use lsp_async_stub::util::Mapper;
+    use lsp_types::{
+        Position as LspPosition, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use taplo_common::{
+        environment::native::NativeEnvironment,
+        schema::associations::{priority, source, AssociationRule, SchemaAssociation},
+    };
+
+    use crate::world::{DocumentState, WorldState};
+
+    /// Builds a world holding one document and one schema associated with it.
+    ///
+    /// `Cache::store` reports an error when no disk cache path is set but has
+    /// already populated the in-memory cache, which is all a test needs.
+    /// `NativeEnvironment::new` requires an active tokio runtime, so every
+    /// caller must be a `#[tokio::test]`.
+    pub(crate) async fn world_with(
+        schema: serde_json::Value,
+        source: &str,
+    ) -> (Arc<WorldState<NativeEnvironment>>, Url) {
+        let world = Arc::new(WorldState::new(NativeEnvironment::new()));
+        let document_url: Url = "root:///test.toml".parse().unwrap();
+        let schema_url: Url = "file:///taplo-test/schema.json".parse().unwrap();
+
+        {
+            let mut workspaces = world.workspaces.write().await;
+            let ws = workspaces.by_document_mut(&document_url);
+
+            drop(
+                ws.schemas
+                    .cache()
+                    .store(schema_url.clone(), Arc::new(schema))
+                    .await,
+            );
+
+            ws.schemas.associations().add(
+                AssociationRule::glob("**/*.toml").unwrap(),
+                SchemaAssociation {
+                    url: schema_url,
+                    meta: json!({ "source": source::MANUAL }),
+                    priority: priority::MAX,
+                },
+            );
+
+            let parse = taplo::parser::parse(source);
+            let mapper = Mapper::new_utf16(source, false);
+            let dom = parse.clone().into_dom();
+            ws.documents
+                .insert(document_url.clone(), DocumentState { parse, dom, mapper });
+        }
+
+        (world, document_url)
+    }
+
+    /// Returns the markdown the hover handler produces at a position on line 0.
+    pub(crate) async fn hover_at(
+        schema: serde_json::Value,
+        source: &str,
+        character: u32,
+    ) -> Option<String> {
+        let (world, document_url) = world_with(schema, source).await;
+
+        let hovered = hover(
+            lsp_async_stub::Context::detached(world),
+            Some(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: document_url },
+                    position: LspPosition::new(0, character),
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .into(),
+        )
+        .await
+        .unwrap()?;
+
+        match hovered.contents {
+            HoverContents::Markup(markup) => Some(markup.value),
+            other => panic!("expected markup hover contents, got {other:?}"),
+        }
+    }
+
+    fn described(description: &str) -> serde_json::Value {
+        json!({ "type": "integer", "description": description })
+    }
 
     #[test]
     fn renders_defaults_as_toml_literals() {
         let cases = [
-            (json!(8080), "Default: `8080`"),
-            (json!("info"), "Default: `\"info\"`"),
-            (json!(false), "Default: `false`"),
-            (json!([1, 2]), "Default: `[ 1, 2 ]`"),
-            (json!({ "level": 1 }), "Default: `{ level = 1 }`"),
+            (json!(8080), "8080"),
+            (json!("info"), "\"info\""),
+            (json!(false), "false"),
+            (json!([1, 2]), "[ 1, 2 ]"),
+            (json!({ "level": 1 }), "{ level = 1 }"),
         ];
 
         for (default, expected) in cases {
             let schema = json!({ "default": default });
-            assert_eq!(default_value_markdown(&schema).as_deref(), Some(expected));
+            let fact = default_fact(&schema).expect("no default fact");
+            assert_eq!(fact.label, "Default");
+            assert_eq!(fact.values, [expected]);
         }
     }
 
     #[test]
     fn skips_absent_and_null_defaults() {
-        assert_eq!(default_value_markdown(&json!({})), None);
-        assert_eq!(default_value_markdown(&json!({ "default": null })), None);
+        assert!(default_fact(&json!({})).is_none());
+        assert!(default_fact(&json!({ "default": null })).is_none());
+    }
+
+    #[test]
+    fn renders_nothing_for_empty_sections() {
+        assert_eq!(HoverSections::default().render(), "");
+    }
+
+    #[test]
+    fn renders_docs_alone_without_a_list() {
+        let sections = HoverSections {
+            docs: Some("prose".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(sections.render(), "prose");
+    }
+
+    #[test]
+    fn renders_facts_alone_as_a_bullet_list() {
+        let sections = HoverSections {
+            facts: vec![
+                Fact { label: "Default", values: vec!["1".into()] },
+                Fact { label: "Read-only", values: Vec::new() },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(sections.render(), "- Default: `1`\n- Read-only");
+    }
+
+    #[test]
+    fn renders_every_section_separated_by_blank_lines() {
+        let sections = HoverSections {
+            banners: vec!["> **Deprecated**".into()],
+            docs: Some("prose".into()),
+            facts: vec![Fact { label: "Default", values: vec!["1".into()] }],
+        };
+
+        assert_eq!(
+            sections.render(),
+            "> **Deprecated**\n\nprose\n\n- Default: `1`"
+        );
+    }
+
+    #[test]
+    fn code_spans_widen_past_backticks_in_the_value() {
+        assert_eq!(code_span("plain"), "`plain`");
+        assert_eq!(code_span("a ` b"), "``a ` b``");
+        assert_eq!(code_span("a ``` b"), "````a ``` b````");
+    }
+
+    #[test]
+    fn code_spans_pad_values_that_start_or_end_with_a_backtick() {
+        assert_eq!(code_span("`x"), "`` `x ``");
+        assert_eq!(code_span("x`"), "`` x` ``");
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_the_default_as_a_bullet() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "port": { "type": "integer", "description": "The port.", "default": 8080 }
+            }
+        });
+
+        assert_eq!(
+            hover_at(schema, "port = 8080\n", 1).await.as_deref(),
+            Some("The port.\n\n- Default: `8080`")
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_separates_schemas_with_a_rule() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "port": {
+                    "anyOf": [described("first branch"), described("second branch")]
+                }
+            }
+        });
+
+        let content = hover_at(schema, "port = 8080\n", 1).await.unwrap();
+
+        assert_eq!(content, "first branch\n\n---\n\nsecond branch");
+        assert_eq!(content.matches("---").count(), 1);
     }
 }
