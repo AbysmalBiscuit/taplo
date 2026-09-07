@@ -11,7 +11,7 @@ use lsp_async_stub::{
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 use serde_json::Value;
 use taplo::{
-    dom::{KeyOrIndex, Keys},
+    dom::{KeyOrIndex, Keys, Node},
     syntax::SyntaxKind::{
         self, BOOL, DATE, DATE_TIME_LOCAL, DATE_TIME_OFFSET, IDENT, INTEGER, INTEGER_BIN,
         INTEGER_HEX, INTEGER_OCT, MULTI_LINE_STRING, MULTI_LINE_STRING_LITERAL, STRING,
@@ -140,6 +140,13 @@ pub(crate) async fn hover<E: Environment>(
                         s += &docs;
                     } else if let Some(desc) = schema["description"].as_str() {
                         s += desc;
+                    }
+
+                    if let Some(default) = default_value_markdown(schema) {
+                        if !s.is_empty() {
+                            s += "\n\n";
+                        }
+                        s += &default;
                     }
 
                     let link_title = schema["title"].as_str().unwrap_or("...");
@@ -276,6 +283,21 @@ pub(crate) async fn hover<E: Environment>(
     Ok(None)
 }
 
+/// Renders a schema's `default` as a TOML literal, so that hovering a key shows
+/// the value the tool falls back to. `x-taplo.docs.defaultValue` documents the
+/// same keyword in prose and is rendered separately.
+fn default_value_markdown(schema: &Value) -> Option<String> {
+    let default = schema.get("default")?;
+
+    if default.is_null() {
+        return None;
+    }
+
+    let node: Node = serde_json::from_value(default.clone()).ok()?;
+
+    Some(format!("Default: `{}`", node.to_toml(true, false)))
+}
+
 fn is_primitive(kind: SyntaxKind) -> bool {
     matches!(
         kind,
@@ -292,4 +314,32 @@ fn is_primitive(kind: SyntaxKind) -> bool {
             | INTEGER_OCT
             | INTEGER_BIN
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_value_markdown;
+    use serde_json::json;
+
+    #[test]
+    fn renders_defaults_as_toml_literals() {
+        let cases = [
+            (json!(8080), "Default: `8080`"),
+            (json!("info"), "Default: `\"info\"`"),
+            (json!(false), "Default: `false`"),
+            (json!([1, 2]), "Default: `[ 1, 2 ]`"),
+            (json!({ "level": 1 }), "Default: `{ level = 1 }`"),
+        ];
+
+        for (default, expected) in cases {
+            let schema = json!({ "default": default });
+            assert_eq!(default_value_markdown(&schema).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn skips_absent_and_null_defaults() {
+        assert_eq!(default_value_markdown(&json!({})), None);
+        assert_eq!(default_value_markdown(&json!({ "default": null })), None);
+    }
 }
