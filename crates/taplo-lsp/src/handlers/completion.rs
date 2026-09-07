@@ -436,25 +436,12 @@ pub async fn completion<E: Environment>(
 }
 
 fn documentation(schema: &Value) -> Option<Documentation> {
-    if let Some(ext) = schema_ext_of(schema) {
-        if let Some(docs) = ext.docs {
-            if let Some(docs) = docs.main {
-                return Some(Documentation::MarkupContent(MarkupContent {
-                    kind: lsp_types::MarkupKind::Markdown,
-                    value: docs,
-                }));
-            }
-        }
-    }
-
-    if let Some(docs) = schema["description"].as_str() {
-        return Some(Documentation::MarkupContent(MarkupContent {
+    super::hover::schema_docs(schema).map(|value| {
+        Documentation::MarkupContent(MarkupContent {
             kind: lsp_types::MarkupKind::Markdown,
-            value: docs.into(),
-        }));
-    }
-
-    None
+            value,
+        })
+    })
 }
 
 fn add_value_completions(
@@ -467,9 +454,7 @@ fn add_value_completions(
     let ext_docs = ext.docs.unwrap_or_default();
     let enum_docs = ext_docs.enum_values.unwrap_or_default();
 
-    let schema_docs = ext_docs
-        .main
-        .or_else(|| schema["description"].as_str().map(Into::into));
+    let schema_docs = super::hover::schema_docs(schema);
 
     if let Some(enum_values) = schema["enum"].as_array() {
         for (idx, val) in enum_values.iter().enumerate() {

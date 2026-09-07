@@ -222,15 +222,9 @@ pub(crate) async fn hover<E: Environment>(
                         }
                     }
 
-                    if let Some(docs) = ext_docs.main {
-                        docs
-                    } else if let Some(desc) = schema["description"].as_str() {
-                        desc.to_string()
-                    } else if let Some(title) = schema["title"].as_str() {
-                        title.to_string()
-                    } else {
-                        String::new()
-                    }
+                    schema_docs(schema)
+                        .or_else(|| schema["title"].as_str().map(Into::into))
+                        .unwrap_or_default()
                 })
                 .join("\n");
 
@@ -346,10 +340,27 @@ fn default_fact(schema: &Value) -> Option<Fact> {
     })
 }
 
+/// The prose a schema offers for a key.
+///
+/// `x-taplo.docs.main` is Taplo's own override and outranks both standard
+/// keywords; `markdownDescription` is the VS Code convention for rich text and
+/// outranks the plain `description`. Every hover and completion documentation
+/// Taplo emits is declared as markdown, so the richer text is always usable.
+pub(crate) fn schema_docs(schema: &Value) -> Option<String> {
+    let ext_docs = schema_ext_of(schema)
+        .unwrap_or_default()
+        .docs
+        .unwrap_or_default();
+
+    ext_docs
+        .main
+        .or_else(|| schema["markdownDescription"].as_str().map(Into::into))
+        .or_else(|| schema["description"].as_str().map(Into::into))
+}
+
 /// Collects everything hover shows for a key from one schema.
 fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
     let ext = schema_ext_of(schema).unwrap_or_default();
-    let ext_docs = ext.docs.unwrap_or_default();
     let ext_links = ext.links.unwrap_or_default();
 
     let mut sections = HoverSections::default();
@@ -361,9 +372,7 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
         }
     }
 
-    sections.docs = ext_docs
-        .main
-        .or_else(|| schema["description"].as_str().map(Into::into));
+    sections.docs = schema_docs(schema);
 
     sections.facts.extend(default_fact(schema));
 
@@ -589,5 +598,80 @@ pub(crate) mod tests {
 
         assert_eq!(content, "first branch\n\n---\n\nsecond branch");
         assert_eq!(content.matches("---").count(), 1);
+    }
+
+    #[test]
+    fn documentation_precedence_prefers_taplo_then_markdown() {
+        let all_three = json!({
+            "x-taplo": { "docs": { "main": "taplo" } },
+            "markdownDescription": "markdown",
+            "description": "plain"
+        });
+        assert_eq!(schema_docs(&all_three).as_deref(), Some("taplo"));
+
+        let two = json!({ "markdownDescription": "markdown", "description": "plain" });
+        assert_eq!(schema_docs(&two).as_deref(), Some("markdown"));
+
+        let one = json!({ "description": "plain" });
+        assert_eq!(schema_docs(&one).as_deref(), Some("plain"));
+
+        assert_eq!(schema_docs(&json!({})), None);
+    }
+
+    #[test]
+    fn a_non_string_markdown_description_is_ignored() {
+        let schema = json!({ "markdownDescription": 12, "description": "plain" });
+        assert_eq!(schema_docs(&schema).as_deref(), Some("plain"));
+    }
+
+    #[tokio::test]
+    async fn key_hover_prefers_the_markdown_description() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "port": {
+                    "type": "integer",
+                    "markdownDescription": "**rich**",
+                    "description": "plain"
+                }
+            }
+        });
+
+        assert_eq!(
+            hover_at(schema, "port = 8080\n", 1).await.as_deref(),
+            Some("**rich**")
+        );
+    }
+
+    #[tokio::test]
+    async fn value_hover_prefers_the_markdown_description() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "port": {
+                    "type": "integer",
+                    "markdownDescription": "**rich**",
+                    "description": "plain"
+                }
+            }
+        });
+
+        assert_eq!(
+            hover_at(schema, "port = 8080\n", 8).await.as_deref(),
+            Some("**rich**")
+        );
+    }
+
+    #[tokio::test]
+    async fn value_hover_still_falls_back_to_the_title() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "port": { "type": "integer", "title": "Port" } }
+        });
+
+        assert_eq!(
+            hover_at(schema, "port = 8080\n", 8).await.as_deref(),
+            Some("Port")
+        );
     }
 }

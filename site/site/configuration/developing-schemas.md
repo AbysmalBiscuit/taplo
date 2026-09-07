@@ -31,7 +31,7 @@ The example below contains all the currently supported extension fields:
     "hidden": true,
     "docs": {
       // Main documentation for the schema, it is expected to be markdown.
-      // If this is omitted, the description will be used.
+      // If this is omitted, `markdownDescription` is used, then `description`.
       "main": "This is [My Schema](https://example.com/mySchema)",
       // Documentation of the enum values, these are used when selecting
       // the values completion or hovering over them.
