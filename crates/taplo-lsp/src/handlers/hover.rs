@@ -254,8 +254,9 @@ pub(crate) async fn hover<E: Environment>(
 /// `Read-only` with none.
 struct Fact {
     label: &'static str,
-    /// Rendered TOML literals. `HoverSections::render` fences each as a code
-    /// span, so a contributor never writes a backtick itself.
+    /// Rendered values: TOML literals, comparisons, regular expressions and
+    /// format names. `HoverSections::render` fences each as a code span, so a
+    /// contributor never writes a backtick itself.
     values: Vec<String>,
 }
 
@@ -576,6 +577,29 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
         sections
             .facts
             .extend(string_fact(schema, "Encoding", "contentEncoding"));
+    }
+
+    if admits_type(schema, "array") {
+        sections.facts.extend(bounds_fact(
+            "Items",
+            inclusive_bounds(schema, "minItems"),
+            inclusive_bounds(schema, "maxItems"),
+        ));
+
+        if flag(schema, "uniqueItems") {
+            sections.facts.push(Fact {
+                label: "Unique items",
+                values: Vec::new(),
+            });
+        }
+    }
+
+    if admits_type(schema, "object") {
+        sections.facts.extend(bounds_fact(
+            "Properties",
+            inclusive_bounds(schema, "minProperties"),
+            inclusive_bounds(schema, "maxProperties"),
+        ));
     }
 
     if flag(schema, "readOnly") {
@@ -1359,6 +1383,87 @@ pub(crate) mod tests {
                 r"- Pattern: `^[\w.-]+$`",
                 "\n",
                 "- Format: `semver`"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_array_constraints() {
+        assert_eq!(
+            key_hover_for(json!({
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "uniqueItems": true
+            }))
+            .await
+            .unwrap(),
+            "- Items: `>= 1`, `<= 3`\n- Unique items"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_ignores_a_unique_items_that_is_not_true() {
+        for unique in [json!(false), json!("yes"), json!(1)] {
+            assert_eq!(
+                key_hover_for(json!({ "type": "array", "uniqueItems": unique })).await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_object_constraints() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "object", "minProperties": 1, "maxProperties": 5 }))
+                .await
+                .unwrap(),
+            "- Properties: `>= 1`, `<= 5`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_drops_container_keywords_the_declared_type_makes_dead() {
+        for property in [
+            json!({ "type": "integer", "minItems": 5 }),
+            json!({ "type": "integer", "uniqueItems": true }),
+            json!({ "type": "string", "minProperties": 5 }),
+            json!({ "type": "object", "minItems": 1 }),
+        ] {
+            assert_eq!(key_hover_for(property).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_every_constraint_an_untyped_schema_writes() {
+        let content = key_hover_for(json!({
+            "minimum": 1,
+            "multipleOf": 2,
+            "minLength": 1,
+            "pattern": "^a$",
+            "format": "email",
+            "contentMediaType": "text/plain",
+            "contentEncoding": "base64",
+            "minItems": 1,
+            "uniqueItems": true,
+            "minProperties": 1
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            content,
+            concat!(
+                "- Range: `>= 1`\n",
+                "- Multiple of: `2`\n",
+                "- Length: `>= 1`\n",
+                "- Pattern: `^a$`\n",
+                "- Format: `email`\n",
+                "- Media type: `text/plain`\n",
+                "- Encoding: `base64`\n",
+                "- Items: `>= 1`\n",
+                "- Unique items\n",
+                "- Properties: `>= 1`"
             )
         );
     }
