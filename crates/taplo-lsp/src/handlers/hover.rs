@@ -459,6 +459,36 @@ fn multiple_of_fact(schema: &Value) -> Option<Fact> {
     })
 }
 
+/// Reads a keyword that bounds a size or a count, which no draft spells as
+/// exclusive.
+///
+/// The result is a `Vec` of at most one so that every caller of `bounds_fact`
+/// has the same shape.
+fn inclusive_bounds(schema: &Value, keyword: &str) -> Vec<Bound> {
+    schema[keyword]
+        .as_number()
+        .map(|value| Bound {
+            value: value.clone(),
+            exclusive: false,
+        })
+        .into_iter()
+        .collect()
+}
+
+/// A fact whose only value is a string the schema states verbatim, such as a
+/// regular expression or a format name.
+///
+/// An empty string constrains nothing, and an empty code span is not a code
+/// span, so it contributes no fact.
+fn string_fact(schema: &Value, label: &'static str, keyword: &str) -> Option<Fact> {
+    let value = schema[keyword].as_str().filter(|value| !value.is_empty())?;
+
+    Some(Fact {
+        label,
+        values: vec![value.to_owned()],
+    })
+}
+
 /// Whether a schema's declared `type` admits instances of `wanted`, and so
 /// whether a keyword constraining `wanted` can ever fire.
 ///
@@ -526,6 +556,26 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
     if admits_type(schema, "number") {
         sections.facts.extend(range_fact(schema));
         sections.facts.extend(multiple_of_fact(schema));
+    }
+
+    if admits_type(schema, "string") {
+        sections.facts.extend(bounds_fact(
+            "Length",
+            inclusive_bounds(schema, "minLength"),
+            inclusive_bounds(schema, "maxLength"),
+        ));
+        sections
+            .facts
+            .extend(string_fact(schema, "Pattern", "pattern"));
+        sections
+            .facts
+            .extend(string_fact(schema, "Format", "format"));
+        sections
+            .facts
+            .extend(string_fact(schema, "Media type", "contentMediaType"));
+        sections
+            .facts
+            .extend(string_fact(schema, "Encoding", "contentEncoding"));
     }
 
     if flag(schema, "readOnly") {
@@ -1158,6 +1208,158 @@ pub(crate) mod tests {
         assert_eq!(
             content,
             "The port.\n\n- Default: `8080`\n- Range: `>= 1`, `<= 65535`\n- Read-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_a_string_length() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "minLength": 1, "maxLength": 128 }))
+                .await
+                .unwrap(),
+            "- Length: `>= 1`, `<= 128`"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "maxLength": 128 }))
+                .await
+                .unwrap(),
+            "- Length: `<= 128`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_collapses_a_fixed_string_length() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "minLength": 40, "maxLength": 40 }))
+                .await
+                .unwrap(),
+            "- Length: `40`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_a_pattern() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "pattern": r"^v\d+$" }))
+                .await
+                .unwrap(),
+            r"- Pattern: `^v\d+$`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_fences_a_pattern_containing_backticks() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "pattern": "a`b" }))
+                .await
+                .unwrap(),
+            "- Pattern: ``a`b``"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "pattern": "`x" }))
+                .await
+                .unwrap(),
+            "- Pattern: `` `x ``"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_a_format_whether_or_not_taplo_enforces_it() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "format": "semver" }))
+                .await
+                .unwrap(),
+            "- Format: `semver`"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "string", "format": "uri-template" }))
+                .await
+                .unwrap(),
+            "- Format: `uri-template`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_content_annotations() {
+        assert_eq!(
+            key_hover_for(json!({
+                "type": "string",
+                "contentMediaType": "application/json",
+                "contentEncoding": "base64"
+            }))
+            .await
+            .unwrap(),
+            "- Media type: `application/json`\n- Encoding: `base64`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_ignores_string_keywords_of_the_wrong_shape() {
+        for property in [
+            json!({ "type": "string", "pattern": 12 }),
+            json!({ "type": "string", "format": 12 }),
+            json!({ "type": "string", "pattern": "" }),
+            json!({ "type": "string", "format": "" }),
+            json!({ "type": "string", "contentMediaType": "" }),
+            json!({ "type": "string", "contentEncoding": "" }),
+            json!({ "type": "string", "minLength": "1" }),
+        ] {
+            assert_eq!(key_hover_for(property).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hover_drops_string_keywords_the_declared_type_makes_dead() {
+        for property in [
+            json!({ "type": "integer", "minLength": 5 }),
+            json!({ "type": "integer", "pattern": "^a$" }),
+            json!({ "type": "integer", "format": "email" }),
+            json!({ "type": "integer", "contentEncoding": "base64" }),
+        ] {
+            assert_eq!(key_hover_for(property).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_string_constraints_for_a_type_union() {
+        assert_eq!(
+            key_hover_for(json!({ "type": ["string", "null"], "minLength": 1 }))
+                .await
+                .unwrap(),
+            "- Length: `>= 1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_a_documented_string_key_as_five_bullets() {
+        let content = key_hover_for(json!({
+            "type": "string",
+            "description": "The image tag to deploy.",
+            "default": "latest",
+            "examples": ["v1.2.3", "latest"],
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": r"^[\w.-]+$",
+            "format": "semver"
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            content,
+            concat!(
+                "The image tag to deploy.\n",
+                "\n",
+                "- Default: `\"latest\"`\n",
+                "- Examples: `\"v1.2.3\"`, `\"latest\"`\n",
+                "- Length: `>= 1`, `<= 128`\n",
+                r"- Pattern: `^[\w.-]+$`",
+                "\n",
+                "- Format: `semver`"
+            )
         );
     }
 }
