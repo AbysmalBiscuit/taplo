@@ -16,7 +16,8 @@
 - Only two features may be added to it: `draft201909` and `draft202012`. Both are `[]` in the dependency's manifest, so `Cargo.lock` must not change.
 - Only two crates are touched: `crates/taplo-common/Cargo.toml` and `crates/taplo-common/src/schema/`. No changes to `taplo-lsp`, `taplo-cli` or `taplo-wasm`.
 - The unhonored-draft report is a `tracing::warn!` event, never a document diagnostic. Do not change the return type of `validate` or `validate_root`.
-- Tests live in `crates/taplo-common/src/schema/tests.rs`, which is gated `#[cfg(all(test, feature = "reqwest"))]`. They run only under `cargo test -p taplo-common --features schema,reqwest,rustls-tls`.
+- Tests live in `crates/taplo-common/src/schema/tests.rs`, which is gated `#[cfg(all(test, feature = "reqwest"))]`. The dedicated command is `cargo test -p taplo-common --features schema,reqwest,rustls-tls`; `cargo test --workspace` also runs them, because `taplo-lsp` enables `schema` and `reqwest` on `taplo-common` and cargo unifies features.
+- CI runs `cargo fmt --check`. Keep `schema/mod.rs` and `schema/tests.rs` rustfmt-clean. A pre-existing diff in `schema/associations.rs` is out of scope; leave it alone.
 - Commit messages are Conventional Commits: imperative mood, lowercase after the colon, subject at most 50 characters.
 - Comments state what the code does and the non-obvious why. Never reference this plan, a task number, an issue, or "previously"/"now we".
 - Use absolute paths and `git -C /home/lev/Git/lev/taplo-wt/schema-draft-versions` for every command. Never `cd`. Never `git stash`. Never `git push`.
@@ -288,9 +289,10 @@ Expected: 8 passed (the 3 pre-existing plus the 5 new).
 ```bash
 cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-draft-versions/Cargo.toml --workspace --all-targets
 cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-draft-versions/Cargo.toml --workspace
+cargo fmt --manifest-path /home/lev/Git/lev/taplo-wt/schema-draft-versions/Cargo.toml -p taplo-common --check
 ```
 
-Expected: both exit 0, no new warnings in `taplo-common`.
+Expected: the first two exit 0 with no new warnings in `taplo-common`. `cargo fmt --check` must report no diff in `schema/mod.rs` or `schema/tests.rs`; a diff in `schema/associations.rs` is pre-existing and out of scope.
 
 - [ ] **Step 6: Commit**
 
@@ -392,8 +394,10 @@ async fn errors_for(schema: Value) -> (Vec<String>, Draft) {
 
 #[tokio::test]
 async fn draft_2020_12_without_a_fragment_is_honored() {
-    let (errors, draft) =
-        errors_for(unevaluated_properties_schema("https://json-schema.org/draft/2020-12/schema")).await;
+    let (errors, draft) = errors_for(unevaluated_properties_schema(
+        "https://json-schema.org/draft/2020-12/schema",
+    ))
+    .await;
 
     assert_eq!(draft, Draft::Draft202012);
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -401,8 +405,10 @@ async fn draft_2020_12_without_a_fragment_is_honored() {
 
 #[tokio::test]
 async fn draft_2020_12_with_a_fragment_is_honored() {
-    let (errors, draft) =
-        errors_for(unevaluated_properties_schema("https://json-schema.org/draft/2020-12/schema#")).await;
+    let (errors, draft) = errors_for(unevaluated_properties_schema(
+        "https://json-schema.org/draft/2020-12/schema#",
+    ))
+    .await;
 
     assert_eq!(draft, Draft::Draft202012);
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -410,8 +416,10 @@ async fn draft_2020_12_with_a_fragment_is_honored() {
 
 #[tokio::test]
 async fn draft_2019_09_is_honored() {
-    let (errors, draft) =
-        errors_for(unevaluated_properties_schema("https://json-schema.org/draft/2019-09/schema")).await;
+    let (errors, draft) = errors_for(unevaluated_properties_schema(
+        "https://json-schema.org/draft/2019-09/schema",
+    ))
+    .await;
 
     assert_eq!(draft, Draft::Draft201909);
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -419,8 +427,10 @@ async fn draft_2019_09_is_honored() {
 
 #[tokio::test]
 async fn an_unsupported_draft_falls_back_to_draft_7() {
-    let (_, draft) =
-        errors_for(unevaluated_properties_schema("http://json-schema.org/draft-03/schema#")).await;
+    let (_, draft) = errors_for(unevaluated_properties_schema(
+        "http://json-schema.org/draft-03/schema#",
+    ))
+    .await;
 
     assert_eq!(draft, Draft::Draft7);
 }
@@ -513,7 +523,9 @@ cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-draft-versions/Carg
 
 Expected: a compile error — `cannot find function \`declared_draft\` in this scope`, `cannot find type \`DeclaredDraft\` in this scope`, and `cannot find type \`Draft\` in this scope`, the last because step 4 has not yet added `Draft` to the `jsonschema` import in `mod.rs`. That is the right failure: nothing under test exists yet.
 
-To see the runtime failure the feature actually fixes, temporarily add `use jsonschema::Draft;` to `tests.rs`, comment out `declared_draft_classifies_every_meta_schema_uri`, and re-run. Expected then: `draft_2020_12_without_a_fragment_is_honored` and `draft_2019_09_is_honored` fail with `left: Draft7, right: Draft202012` / `Draft201909`, because `draft_from_url` demands the trailing `#`. `draft_2020_12_with_a_fragment_is_honored` passes already — enabling the features in step 1 is enough for that one — and `custom_formats_still_assert_under_draft_2020_12` fails with `left: 0, right: 1`, which is the format regression the guard in step 4 prevents. Remove the temporary import and uncomment the test before continuing.
+To see the runtime failure the feature actually fixes, temporarily add `use jsonschema::Draft;` to `tests.rs`, comment out `declared_draft_classifies_every_meta_schema_uri`, and re-run. Expected then: `draft_2020_12_without_a_fragment_is_honored` and `draft_2019_09_is_honored` fail with `left: Draft7, right: Draft202012` / `Draft201909`, because `draft_from_url` demands the trailing `#`. `draft_2020_12_with_a_fragment_is_honored` passes already — enabling the features in step 1 is enough for that one — and `custom_formats_still_assert_under_draft_2020_12` fails on its first assertion with `left: Draft7, right: Draft202012`, for the same trailing-`#` reason. The format regression it guards is not visible yet: it appears only once the draft is honored, and step 4's `should_validate_formats(true)` is what then keeps this test at 1 error instead of 0. To see that for yourself, finish step 4, delete the `should_validate_formats(true)` line, and re-run: the test fails `left: 0, right: 1`. Put the line back.
+
+Remove the temporary import and uncomment the test before continuing.
 
 - [ ] **Step 4: Detect the draft and pass it explicitly**
 
@@ -605,8 +617,9 @@ fn declared_draft(schema: &Value) -> DeclaredDraft {
         return DeclaredDraft::Unrecognized;
     };
 
-    // The canonical form carries a trailing `#` up to draft-07 and omits it
-    // from 2019-09 on, and both forms appear in the wild for both.
+    // Classification goes by host and path, so scheme, case, query and
+    // fragment do not matter. Stripping the trailing `#` that the canonical
+    // form carries up to draft-07 only keeps the reported URI tidy.
     let normalized = declared.strip_suffix('#').unwrap_or(declared);
 
     let Ok(url) = Url::parse(normalized) else {
@@ -644,10 +657,11 @@ If `declared_draft` or `DeclaredDraft` is reported as dead code, the tests are n
 ```bash
 cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-draft-versions/Cargo.toml --workspace --all-targets
 cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-draft-versions/Cargo.toml --workspace
+cargo fmt --manifest-path /home/lev/Git/lev/taplo-wt/schema-draft-versions/Cargo.toml -p taplo-common --check
 git -C /home/lev/Git/lev/taplo-wt/schema-draft-versions status --short
 ```
 
-Expected: both cargo commands exit 0, and `Cargo.lock` is absent from `git status`.
+Expected: the two build commands exit 0; `cargo fmt --check` reports no diff in `schema/mod.rs` or `schema/tests.rs` (a diff in `schema/associations.rs` is pre-existing); `Cargo.lock` is absent from `git status`.
 
 - [ ] **Step 7: Commit**
 
@@ -673,12 +687,12 @@ formats with it."
 
 ---
 
-## Task 3: Record the dependency cost
+## Task 3: Record the dependency cost and reconcile the spec
 
-The tracking issue asks to assess the dependency cost of the two features before committing to them. The features are `[]` in the `jsonschema` manifest, so they add no crates and leave `Cargo.lock` alone; what they add is compiled code. The spec has a table with the baseline filled in and the post-change figure left open.
+The tracking issue asks to assess the dependency cost of the two features before committing to them. The features are `[]` in the `jsonschema` manifest, so they add no crates and leave `Cargo.lock` alone; what they add is compiled code. The spec has a table with the baseline filled in and the post-change figure left open. Three sentences in the spec also describe the implementation slightly wrong and are corrected here, against the code as built.
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-09-07-json-schema-draft-versions.md` (the "Dependency cost" table)
+- Modify: `docs/superpowers/specs/2026-09-07-json-schema-draft-versions.md` (the "Dependency cost" table and three prose corrections)
 
 **Interfaces:** none. Documentation only.
 
@@ -701,7 +715,47 @@ In `docs/superpowers/specs/2026-09-07-json-schema-draft-versions.md`, replace:
 
 with the measured figure, formatted like the baseline row, and add a sentence after the table giving the delta in bytes and as a percentage. Do not invent a number; use what step 1 printed.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Correct three sentences that no longer match the code**
+
+In the same spec file, replace:
+
+```markdown
+Normalization strips one trailing `#`, and nothing else. A `$schema` value that differs from a known meta-schema URI in any other way stays unrecognized, which is the correct outcome.
+```
+
+with:
+
+```markdown
+Classification compares the host and path of the parsed URI, so scheme, case, query and fragment do not matter. A different path on `json-schema.org` is unsupported; a different host is unrecognized.
+```
+
+Replace:
+
+```markdown
+    Unsupported(&'static str),
+```
+
+with:
+
+```markdown
+    Unsupported(String),
+```
+
+The payload is the `$schema` value read at runtime, so it cannot be `&'static str`.
+
+Replace:
+
+```markdown
+A schema that declares draft-04 but uses draft-6 constructs compiles today and will be rejected as an invalid schema.
+```
+
+with:
+
+```markdown
+A schema that declares draft-04 but uses later constructs either has them ignored (`const`, `contains`, `propertyNames`, `if`, which the draft-4 meta-schema does not know) or is rejected as an invalid schema (numeric `exclusiveMaximum`, boolean subschemas, which the draft-4 meta-schema forbids).
+```
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git -C /home/lev/Git/lev/taplo-wt/schema-draft-versions add docs/superpowers/specs/2026-09-07-json-schema-draft-versions.md
