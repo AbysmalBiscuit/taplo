@@ -5,7 +5,7 @@ use async_recursion::async_recursion;
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
 use json_value_merge::Merge;
-use jsonschema::{error::ValidationErrorKind, JSONSchema, SchemaResolver, ValidationError};
+use jsonschema::{error::ValidationErrorKind, Draft, JSONSchema, SchemaResolver, ValidationError};
 use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::Value;
@@ -266,12 +266,37 @@ impl<E: Environment> Schemas<E> {
     }
 
     fn create_validator(&self, schema: &Value) -> Result<JSONSchema, anyhow::Error> {
-        JSONSchema::options()
+        let mut options = JSONSchema::options();
+
+        options
             .with_resolver(CacheSchemaResolver {
                 cache: self.cache().clone(),
             })
             .with_format("semver", formats::semver)
             .with_format("semver-requirement", formats::semver_req)
+            // `format` is an annotation from 2019-09 on, so setting one of
+            // those drafts would otherwise stop every format from asserting,
+            // including the two registered above.
+            .should_validate_formats(true);
+
+        match declared_draft(schema) {
+            // An explicit draft takes precedence over the `$schema` sniffing
+            // in `jsonschema`, which matches meta-schema URIs exactly and so
+            // misses the fragment-less form that 2019-09 and 2020-12 use.
+            DeclaredDraft::Supported(draft) => {
+                options.with_draft(draft);
+            }
+            DeclaredDraft::Unsupported(declared) => {
+                tracing::warn!(
+                    %declared,
+                    used = "draft-07",
+                    "schema declares a draft taplo cannot validate, validating as draft-07 instead"
+                );
+            }
+            DeclaredDraft::Unrecognized => {}
+        }
+
+        options
             .compile(schema)
             .map_err(|err| anyhow!("invalid schema: {err}"))
     }
@@ -670,6 +695,47 @@ fn reference_url(root_url: &Url, reference: &str) -> Option<Url> {
     let mut url = root_url.clone();
     url.set_fragment(Some(reference.trim_start_matches("#/")));
     Some(url)
+}
+
+/// How a schema's `$schema` value maps onto a draft taplo can validate against.
+#[derive(Debug, PartialEq, Eq)]
+enum DeclaredDraft {
+    Supported(Draft),
+    /// A meta-schema taplo recognizes as one but has no validator for. Carries
+    /// the declared URI so the warning can name it.
+    Unsupported(String),
+    Unrecognized,
+}
+
+/// Classifies the root `$schema`, which is the only one that counts: a
+/// compiled `JSONSchema` carries a single draft, and every document reached
+/// through `$ref` is compiled under it.
+fn declared_draft(schema: &Value) -> DeclaredDraft {
+    let Some(declared) = schema["$schema"].as_str() else {
+        return DeclaredDraft::Unrecognized;
+    };
+
+    // Classification goes by host and path, so scheme, case, query and
+    // fragment do not matter. Stripping the trailing `#` that the canonical
+    // form carries up to draft-07 only keeps the reported URI tidy.
+    let normalized = declared.strip_suffix('#').unwrap_or(declared);
+
+    let Ok(url) = Url::parse(normalized) else {
+        return DeclaredDraft::Unrecognized;
+    };
+
+    if url.host_str() != Some("json-schema.org") {
+        return DeclaredDraft::Unrecognized;
+    }
+
+    match url.path() {
+        "/draft-04/schema" => DeclaredDraft::Supported(Draft::Draft4),
+        "/draft-06/schema" => DeclaredDraft::Supported(Draft::Draft6),
+        "/draft-07/schema" => DeclaredDraft::Supported(Draft::Draft7),
+        "/draft/2019-09/schema" => DeclaredDraft::Supported(Draft::Draft201909),
+        "/draft/2020-12/schema" => DeclaredDraft::Supported(Draft::Draft202012),
+        _ => DeclaredDraft::Unsupported(normalized.to_owned()),
+    }
 }
 
 pub trait ValueExt {
