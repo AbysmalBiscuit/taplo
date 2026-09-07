@@ -439,27 +439,29 @@ impl<E: Environment> Schemas<E> {
                 }
             }
             KeyOrIndex::Index(idx) => {
-                if schema["items"].is_array() {
-                    self.collect_schemas(
-                        root_url,
-                        &schema["items"][idx],
-                        &value[idx],
-                        full_path.join(*idx),
-                        &child_path,
-                        schemas,
-                    )
-                    .await?;
+                // `prefixItems` and `items` partition the array: the leading
+                // positions belong to `prefixItems`, the rest to `items`.
+                let covered_by_prefix_items = schema["prefixItems"]
+                    .as_array()
+                    .is_some_and(|prefix_items| *idx < prefix_items.len());
+
+                let item_schema = if covered_by_prefix_items {
+                    &schema["prefixItems"][idx]
+                } else if schema["items"].is_array() {
+                    &schema["items"][idx]
                 } else {
-                    self.collect_schemas(
-                        root_url,
-                        &schema["items"],
-                        &value[idx],
-                        full_path.join(*idx),
-                        &child_path,
-                        schemas,
-                    )
-                    .await?;
-                }
+                    &schema["items"]
+                };
+
+                self.collect_schemas(
+                    root_url,
+                    item_schema,
+                    &value[idx],
+                    full_path.join(*idx),
+                    &child_path,
+                    schemas,
+                )
+                .await?;
             }
         }
 

@@ -86,3 +86,130 @@ async fn mutually_referential_all_of_terminates() {
         .await
         .unwrap();
 }
+
+/// Collects `description` from each schema so assertions name which branch
+/// of the schema was reached rather than comparing whole JSON values.
+fn descriptions(schemas: &[(Keys, Arc<Value>)]) -> Vec<&str> {
+    schemas
+        .iter()
+        .filter_map(|(_, s)| s["description"].as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn prefix_items_resolves_at_covered_index() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "pair": {
+                "type": "array",
+                "prefixItems": [
+                    { "type": "string", "description": "head" },
+                    { "type": "integer", "description": "second" }
+                ]
+            }
+        }
+    }))
+    .await;
+
+    let keys = "pair".parse::<Keys>().unwrap().join(0_usize);
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["head"]);
+}
+
+#[tokio::test]
+async fn prefix_items_falls_through_to_items_past_the_end() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "pair": {
+                "type": "array",
+                "prefixItems": [{ "type": "string", "description": "head" }],
+                "items": { "type": "integer", "description": "tail" }
+            }
+        }
+    }))
+    .await;
+
+    let keys = "pair".parse::<Keys>().unwrap().join(1_usize);
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["tail"]);
+}
+
+#[tokio::test]
+async fn items_does_not_apply_at_an_index_prefix_items_covers() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "pair": {
+                "type": "array",
+                "prefixItems": [{ "type": "string", "description": "head" }],
+                "items": { "type": "integer", "description": "tail" }
+            }
+        }
+    }))
+    .await;
+
+    let keys = "pair".parse::<Keys>().unwrap().join(0_usize);
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["head"]);
+}
+
+#[tokio::test]
+async fn draft_7_tuple_items_still_resolve_by_position() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "pair": {
+                "type": "array",
+                "items": [
+                    { "type": "string", "description": "head" },
+                    { "type": "integer", "description": "second" }
+                ]
+            }
+        }
+    }))
+    .await;
+
+    let keys = "pair".parse::<Keys>().unwrap().join(1_usize);
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["second"]);
+}
+
+#[tokio::test]
+async fn single_schema_items_still_resolve_at_every_index() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "list": {
+                "type": "array",
+                "items": { "type": "string", "description": "every element" }
+            }
+        }
+    }))
+    .await;
+
+    let keys = "list".parse::<Keys>().unwrap().join(3_usize);
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["every element"]);
+}
