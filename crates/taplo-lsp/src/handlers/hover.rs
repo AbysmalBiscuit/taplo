@@ -9,7 +9,7 @@ use lsp_async_stub::{
     Context, Params,
 };
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
-use serde_json::Value;
+use serde_json::{Number, Value};
 use taplo::{
     dom::{KeyOrIndex, Keys, Node},
     syntax::SyntaxKind::{
@@ -372,6 +372,116 @@ fn examples_fact(schema: &Value) -> Option<Fact> {
     })
 }
 
+/// One end of a range: the bound and whether the schema excludes it.
+struct Bound {
+    value: Number,
+    exclusive: bool,
+}
+
+impl Bound {
+    /// The comparison a reader sees, given the operators for this side.
+    fn render(&self, inclusive: &str, exclusive: &str) -> String {
+        let operator = if self.exclusive { exclusive } else { inclusive };
+        format!("{operator} {}", self.value)
+    }
+}
+
+/// Renders the bounds on a quantity as one fact, so that a lower and an upper
+/// bound share a line rather than taking one each.
+///
+/// A pair of inclusive bounds on the same value collapses to the bare value,
+/// which is how a fixed size reads best. The collapse needs exactly one bound
+/// per side, since a schema writing two bounds on one side has stated two
+/// separate comparisons.
+fn bounds_fact(label: &'static str, lower: Vec<Bound>, upper: Vec<Bound>) -> Option<Fact> {
+    if lower.is_empty() && upper.is_empty() {
+        return None;
+    }
+
+    if let ([low], [high]) = (lower.as_slice(), upper.as_slice()) {
+        if !low.exclusive && !high.exclusive && low.value == high.value {
+            return Some(Fact {
+                label,
+                values: vec![low.value.to_string()],
+            });
+        }
+    }
+
+    let values = lower
+        .iter()
+        .map(|bound| bound.render(">=", ">"))
+        .chain(upper.iter().map(|bound| bound.render("<=", "<")))
+        .collect();
+
+    Some(Fact { label, values })
+}
+
+/// Reads one side of a numeric range.
+///
+/// Both spellings of an exclusive bound are honored, told apart by shape: a
+/// number in the exclusive keyword is the bound itself, while a boolean beside
+/// the inclusive keyword is draft 4's modifier on that bound. A schema may
+/// write both, and both render.
+fn numeric_bounds(schema: &Value, inclusive: &str, exclusive: &str) -> Vec<Bound> {
+    let mut bounds = Vec::new();
+
+    if let Some(value) = schema[inclusive].as_number() {
+        bounds.push(Bound {
+            value: value.clone(),
+            exclusive: flag(schema, exclusive),
+        });
+    }
+
+    if let Some(value) = schema[exclusive].as_number() {
+        bounds.push(Bound {
+            value: value.clone(),
+            exclusive: true,
+        });
+    }
+
+    bounds
+}
+
+/// The range a numeric schema admits.
+fn range_fact(schema: &Value) -> Option<Fact> {
+    bounds_fact(
+        "Range",
+        numeric_bounds(schema, "minimum", "exclusiveMinimum"),
+        numeric_bounds(schema, "maximum", "exclusiveMaximum"),
+    )
+}
+
+/// The step a numeric schema admits.
+fn multiple_of_fact(schema: &Value) -> Option<Fact> {
+    Some(Fact {
+        label: "Multiple of",
+        values: vec![schema["multipleOf"].as_number()?.to_string()],
+    })
+}
+
+/// Whether a schema's declared `type` admits instances of `wanted`, and so
+/// whether a keyword constraining `wanted` can ever fire.
+///
+/// Every constraint keyword is defined conditionally on the instance type, so
+/// one written against a type the schema does not admit is vacuous and hover
+/// leaves it out. A schema that declares no type, or declares one in a shape
+/// the specification does not describe, admits everything: the author wrote
+/// the keyword, and hover has nothing better to go on.
+fn admits_type(schema: &Value, wanted: &str) -> bool {
+    fn matches(declared: &str, wanted: &str) -> bool {
+        declared == wanted || (wanted == "number" && declared == "integer")
+    }
+
+    match &schema["type"] {
+        Value::String(declared) => matches(declared, wanted),
+        Value::Array(declared) => {
+            let mut named = declared.iter().filter_map(Value::as_str).peekable();
+            named.peek().is_none() || named.any(|declared| matches(declared, wanted))
+        }
+        _ => true,
+    }
+}
+
 /// The prose a schema offers for a key.
 ///
 /// `x-taplo.docs.main` is Taplo's own override and outranks both standard
@@ -412,6 +522,11 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
 
     sections.facts.extend(default_fact(schema));
     sections.facts.extend(examples_fact(schema));
+
+    if admits_type(schema, "number") {
+        sections.facts.extend(range_fact(schema));
+        sections.facts.extend(multiple_of_fact(schema));
+    }
 
     if flag(schema, "readOnly") {
         sections.facts.push(Fact {
@@ -860,6 +975,189 @@ pub(crate) mod tests {
         assert_eq!(
             content,
             "> **Deprecated**\n\nThe port.\n\n- Default: `8080`\n- Examples: `80`\n- Read-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_a_two_sided_range() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "minimum": 1, "maximum": 10 }))
+                .await
+                .unwrap(),
+            "- Range: `>= 1`, `<= 10`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_a_one_sided_range() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "minimum": 1 }))
+                .await
+                .unwrap(),
+            "- Range: `>= 1`"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "number", "maximum": 2.5 }))
+                .await
+                .unwrap(),
+            "- Range: `<= 2.5`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_numeric_exclusive_bounds() {
+        assert_eq!(
+            key_hover_for(json!({
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "exclusiveMaximum": 10
+            }))
+            .await
+            .unwrap(),
+            "- Range: `> 0`, `< 10`"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({
+                "type": "integer",
+                "exclusiveMinimum": 5,
+                "exclusiveMaximum": 5
+            }))
+            .await
+            .unwrap(),
+            "- Range: `> 5`, `< 5`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_honors_the_draft_4_boolean_exclusive_bounds() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "minimum": 1, "exclusiveMinimum": true }))
+                .await
+                .unwrap(),
+            "- Range: `> 1`"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "maximum": 10, "exclusiveMaximum": true }))
+                .await
+                .unwrap(),
+            "- Range: `< 10`"
+        );
+
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "minimum": 1, "exclusiveMinimum": false }))
+                .await
+                .unwrap(),
+            "- Range: `>= 1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_ignores_a_boolean_exclusive_bound_with_no_neighbour() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "exclusiveMinimum": true })).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_every_bound_written_on_one_side() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "minimum": 5, "exclusiveMinimum": 0 }))
+                .await
+                .unwrap(),
+            "- Range: `>= 5`, `> 0`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_collapses_equal_inclusive_bounds() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "minimum": 5, "maximum": 5 }))
+                .await
+                .unwrap(),
+            "- Range: `5`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_does_not_collapse_an_integer_against_a_float() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "number", "minimum": 40, "maximum": 40.0 }))
+                .await
+                .unwrap(),
+            "- Range: `>= 40`, `<= 40.0`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_multiple_of() {
+        assert_eq!(
+            key_hover_for(json!({ "type": "integer", "multipleOf": 5 }))
+                .await
+                .unwrap(),
+            "- Multiple of: `5`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_ignores_numeric_keywords_of_the_wrong_shape() {
+        for property in [
+            json!({ "type": "integer", "minimum": "1" }),
+            json!({ "type": "integer", "multipleOf": "5" }),
+            json!({ "type": "integer", "exclusiveMinimum": "0" }),
+        ] {
+            assert_eq!(key_hover_for(property).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hover_drops_numeric_keywords_the_declared_type_makes_dead() {
+        for property in [
+            json!({ "type": "string", "minimum": 1 }),
+            json!({ "type": "string", "multipleOf": 5 }),
+            json!({ "type": "array", "maximum": 10 }),
+        ] {
+            assert_eq!(key_hover_for(property).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_numeric_constraints_for_an_untyped_schema() {
+        assert_eq!(
+            key_hover_for(json!({ "minimum": 1 })).await.unwrap(),
+            "- Range: `>= 1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_renders_numeric_constraints_for_a_type_union() {
+        assert_eq!(
+            key_hover_for(json!({ "type": ["integer", "null"], "minimum": 1 }))
+                .await
+                .unwrap(),
+            "- Range: `>= 1`"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_hover_orders_constraints_between_values_and_access() {
+        let content = key_hover_for(json!({
+            "type": "integer",
+            "description": "The port.",
+            "default": 8080,
+            "minimum": 1,
+            "maximum": 65535,
+            "readOnly": true
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            content,
+            "The port.\n\n- Default: `8080`\n- Range: `>= 1`, `<= 65535`\n- Read-only"
         );
     }
 }
