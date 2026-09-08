@@ -531,6 +531,57 @@ pub(crate) fn schema_docs(schema: &Value) -> Option<String> {
         .or_else(|| schema["description"].as_str().map(Into::into))
 }
 
+/// The constraint keywords a schema states about its own value, in the order
+/// hover lists them.
+///
+/// Each group is filtered by the type its keywords constrain, so a keyword
+/// written against a type the schema does not admit is vacuous and left out.
+fn constraint_facts(schema: &Value) -> Vec<Fact> {
+    let mut facts = Vec::new();
+
+    if admits_type(schema, "number") {
+        facts.extend(range_fact(schema));
+        facts.extend(multiple_of_fact(schema));
+    }
+
+    if admits_type(schema, "string") {
+        facts.extend(bounds_fact(
+            "Length",
+            inclusive_bounds(schema, "minLength"),
+            inclusive_bounds(schema, "maxLength"),
+        ));
+        facts.extend(string_fact(schema, "Pattern", "pattern"));
+        facts.extend(string_fact(schema, "Format", "format"));
+        facts.extend(string_fact(schema, "Media type", "contentMediaType"));
+        facts.extend(string_fact(schema, "Encoding", "contentEncoding"));
+    }
+
+    if admits_type(schema, "array") {
+        facts.extend(bounds_fact(
+            "Items",
+            inclusive_bounds(schema, "minItems"),
+            inclusive_bounds(schema, "maxItems"),
+        ));
+
+        if flag(schema, "uniqueItems") {
+            facts.push(Fact {
+                label: "Unique items",
+                values: Vec::new(),
+            });
+        }
+    }
+
+    if admits_type(schema, "object") {
+        facts.extend(bounds_fact(
+            "Properties",
+            inclusive_bounds(schema, "minProperties"),
+            inclusive_bounds(schema, "maxProperties"),
+        ));
+    }
+
+    facts
+}
+
 /// Collects everything hover shows for a key from one schema.
 fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
     let ext = schema_ext_of(schema).unwrap_or_default();
@@ -553,54 +604,7 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
 
     sections.facts.extend(default_fact(schema));
     sections.facts.extend(examples_fact(schema));
-
-    if admits_type(schema, "number") {
-        sections.facts.extend(range_fact(schema));
-        sections.facts.extend(multiple_of_fact(schema));
-    }
-
-    if admits_type(schema, "string") {
-        sections.facts.extend(bounds_fact(
-            "Length",
-            inclusive_bounds(schema, "minLength"),
-            inclusive_bounds(schema, "maxLength"),
-        ));
-        sections
-            .facts
-            .extend(string_fact(schema, "Pattern", "pattern"));
-        sections
-            .facts
-            .extend(string_fact(schema, "Format", "format"));
-        sections
-            .facts
-            .extend(string_fact(schema, "Media type", "contentMediaType"));
-        sections
-            .facts
-            .extend(string_fact(schema, "Encoding", "contentEncoding"));
-    }
-
-    if admits_type(schema, "array") {
-        sections.facts.extend(bounds_fact(
-            "Items",
-            inclusive_bounds(schema, "minItems"),
-            inclusive_bounds(schema, "maxItems"),
-        ));
-
-        if flag(schema, "uniqueItems") {
-            sections.facts.push(Fact {
-                label: "Unique items",
-                values: Vec::new(),
-            });
-        }
-    }
-
-    if admits_type(schema, "object") {
-        sections.facts.extend(bounds_fact(
-            "Properties",
-            inclusive_bounds(schema, "minProperties"),
-            inclusive_bounds(schema, "maxProperties"),
-        ));
-    }
+    sections.facts.extend(constraint_facts(schema));
 
     if flag(schema, "readOnly") {
         sections.facts.push(Fact {
