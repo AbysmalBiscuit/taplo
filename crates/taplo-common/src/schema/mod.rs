@@ -399,14 +399,19 @@ impl<E: Environment> Schemas<E> {
         Ok(schemas)
     }
 
-    /// Whether the instance satisfies a condition, or `None` when the
-    /// condition cannot be decided and both branches have to be offered.
+    /// Whether the instance satisfies a condition, or `None` when the condition
+    /// cannot be decided and both branches have to be offered.
     ///
     /// A condition that is itself a reference is resolved, one hop, the way
-    /// traversal resolves any schema carrying `$ref`. The condition compiles
-    /// through `create_validator`, which sees no `$schema` on a subschema and
-    /// so compiles it as draft 7 whatever the root declares — the floor a
-    /// draft-4 root needs, since draft 4 has no `const` to discriminate on.
+    /// traversal resolves any schema carrying `$ref`. The references *inside*
+    /// it are made absolute first: a subschema evaluated outside its document
+    /// keeps its `#/...` pointers and loses the document they name, so every
+    /// one of them would fail and the condition would reject every instance.
+    ///
+    /// The condition compiles through `create_validator`, which sees no
+    /// `$schema` on a subschema and so compiles it as draft 7 whatever the root
+    /// declares — the floor a draft-4 root needs, since draft 4 has no `const`
+    /// to discriminate on.
     async fn condition_holds(
         &self,
         base_url: &Url,
@@ -418,21 +423,60 @@ impl<E: Environment> Schemas<E> {
         }
 
         let resolved = self.ref_schema_value(base_url, condition).await;
-        let condition = resolved
-            .as_ref()
-            .map_or(condition, |(_, _, schema)| &**schema);
+        let (base_url, condition) = match &resolved {
+            Some((_, base, schema)) => (base, &**schema),
+            None => (base_url, condition),
+        };
 
-        if names_a_ref(condition) {
-            return None;
-        }
+        let condition = absolute_refs(condition, base_url);
 
-        match self.create_validator(condition) {
-            Ok(validator) => Some(validator.is_valid(instance)),
+        let validator = match self.create_validator(&condition) {
+            Ok(v) => v,
             Err(error) => {
                 tracing::debug!(%error, "condition could not be compiled");
-                None
+                return None;
+            }
+        };
+
+        // A reference is resolved on evaluation rather than on compilation, so
+        // a condition naming a document nothing has fetched compiles cleanly
+        // and reports every instance invalid. `validate` names that case where
+        // `is_valid` cannot, and an unfetched document is retrieved once and
+        // the condition asked again, the way `validate_impl` does it.
+        for attempt in 0..2 {
+            let errors: Vec<_> = match validator.validate(instance) {
+                Ok(()) => return Some(true),
+                Err(errors) => errors.collect(),
+            };
+
+            let mut unresolved = None;
+
+            for error in &errors {
+                match &error.kind {
+                    ValidationErrorKind::Resolver { url, .. } => unresolved = Some(url.clone()),
+                    ValidationErrorKind::InvalidReference { .. } => return None,
+                    _ => {}
+                }
+            }
+
+            let Some(url) = unresolved else {
+                return Some(false);
+            };
+
+            if attempt == 1 {
+                return None;
+            }
+
+            match self.load_schema(&url).await {
+                Ok(value) => drop(self.cache.store(url, value).await),
+                Err(error) => {
+                    tracing::debug!(%error, "condition names a schema that could not be loaded");
+                    return None;
+                }
             }
         }
+
+        None
     }
 
     /// The subschemas that apply to the same instance as `schema` itself and
@@ -1081,22 +1125,6 @@ fn anchored_subschema<'d>(document: &'d Value, base: &Url, url: &Url) -> Option<
             .iter()
             .find_map(|item| anchored_subschema(item, &base, url)),
         _ => None,
-    }
-}
-
-/// Whether a subschema names a reference anywhere within it.
-///
-/// A subschema compiled on its own keeps its `#/...` pointers and loses the
-/// document they point into, so every reference fails to resolve and the
-/// subschema rejects every instance. A condition that names one is therefore
-/// undecidable rather than false.
-fn names_a_ref(schema: &Value) -> bool {
-    match schema {
-        Value::Object(map) => {
-            map.get("$ref").is_some_and(Value::is_string) || map.values().any(names_a_ref)
-        }
-        Value::Array(items) => items.iter().any(names_a_ref),
-        _ => false,
     }
 }
 

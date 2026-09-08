@@ -490,26 +490,93 @@ async fn a_condition_that_is_a_reference_is_resolved() {
 }
 
 #[tokio::test]
-async fn a_condition_holding_a_nested_reference_takes_both_branches() {
+async fn a_condition_holding_a_nested_reference_decides_its_branch() {
+    let schema = json!({
+        "type": "object",
+        "if": {
+            "properties": { "kind": { "$ref": "#/definitions/isDocker" } },
+            "required": ["kind"]
+        },
+        "then": { "properties": { "image": { "description": "then branch" } } },
+        "else": { "properties": { "image": { "description": "else branch" } } },
+        "definitions": { "isDocker": { "const": "docker" } }
+    });
+
+    for (kind, expected) in [("docker", "then branch"), ("podman", "else branch")] {
+        let (schemas, url) = seeded(schema.clone()).await;
+
+        let found = schemas
+            .schemas_at_path(
+                &url,
+                &json!({ "kind": kind }),
+                &"image".parse::<Keys>().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(descriptions(&found), [expected], "for kind = {kind}");
+    }
+}
+
+/// A reference the document cannot supply leaves the condition undecided, so
+/// both branches are offered. Asserted through `schemas_at_path`, because
+/// `is_valid` reports plain `false` for this and deciding by it would pick
+/// `else` silently.
+#[tokio::test]
+async fn a_condition_holding_an_unresolvable_reference_takes_both_branches() {
     let (schemas, url) = seeded(json!({
         "type": "object",
         "if": {
-            "properties": { "kind": { "$ref": "#/definitions/docker" } },
+            "properties": {
+                "kind": { "$ref": "file:///taplo-test/missing.json#/definitions/isDocker" }
+            },
             "required": ["kind"]
         },
-        "then": { "properties": { "image": { "description": "then" } } },
-        "else": { "properties": { "image": { "description": "else" } } },
-        "definitions": { "docker": { "const": "docker" } }
+        "then": { "properties": { "image": { "description": "then branch" } } },
+        "else": { "properties": { "image": { "description": "else branch" } } }
     }))
     .await;
 
-    let keys = "image".parse::<Keys>().unwrap();
     let found = schemas
-        .schemas_at_path(&url, &json!({ "kind": "docker" }), &keys)
+        .schemas_at_path(
+            &url,
+            &json!({ "kind": "docker" }),
+            &"image".parse::<Keys>().unwrap(),
+        )
         .await
         .unwrap();
 
-    assert_eq!(descriptions(&found), ["then", "else"]);
+    let mut found = descriptions(&found);
+    found.sort_unstable();
+    assert_eq!(found, ["else branch", "then branch"]);
+}
+
+#[tokio::test]
+async fn a_condition_holding_a_dangling_pointer_takes_both_branches() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "if": {
+            "properties": { "kind": { "$ref": "#/definitions/nope" } },
+            "required": ["kind"]
+        },
+        "then": { "properties": { "image": { "description": "then branch" } } },
+        "else": { "properties": { "image": { "description": "else branch" } } },
+        "definitions": {}
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(
+            &url,
+            &json!({ "kind": "docker" }),
+            &"image".parse::<Keys>().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut found = descriptions(&found);
+    found.sort_unstable();
+    assert_eq!(found, ["else branch", "then branch"]);
 }
 
 #[tokio::test]
