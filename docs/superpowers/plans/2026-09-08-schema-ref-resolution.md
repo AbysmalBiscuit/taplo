@@ -20,7 +20,8 @@
 - `cargo fmt --check` is not clean at the branch point. Format only the files you touch: run `rustfmt --edition 2021 <file>` on the exact files changed.
 - Two `dead_code` warnings, in `taplo` and `lsp-async-stub`, are inherited and expected.
 - Run `taplo-common`'s schema tests with `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`. `cargo test --workspace` reaches them through feature unification and stops at the first failing crate, so a failure there hides later crates' results.
-- Every timing test uses `tokio::time::timeout` with a bound well under 60 s. The in-memory schema LRU expires at 60 s (`DEFAULT_LRU_CACHE_EXPIRATION_TIME`), after which a seeded test falls through to a file read that fails and reports the wrong failure.
+- Every timing test runs its traversal through `assert_finishes_within` (Task 1), on its own thread, with a bound well under 60 s. `tokio::time::timeout` cannot stop a traversal that never yields — it has no await that reaches the runtime — and at 60 s the in-memory schema LRU expires (`DEFAULT_LRU_CACHE_EXPIRATION_TIME`), after which a seeded test falls through to a file read that fails and reports the wrong failure.
+- Where a step says "PASS", it means every test that passed before the task still passes, plus the ones the task adds. Do not treat a total count as the assertion.
 - The baseline at `dc31977` is green: `cargo check --workspace --all-targets`, `cargo test --workspace`, `cargo test -p taplo-common --features schema,reqwest,rustls-tls` (39 tests), `cargo test -p taplo-lsp --lib handlers::hover` (57 tests), and `cargo check --target wasm32-unknown-unknown --manifest-path crates/taplo-wasm/Cargo.toml`.
 
 ---
@@ -30,7 +31,7 @@
 `MAX_COMPOSITION_DEPTH` bounds how *deep* composition may go, not how much work it may do. A `$ref` hop costs a unit and its target costs another, so a cycle gets sixteen rounds and a branching cycle costs its fan-out to that power. Measured today: an `anyOf` of three references back to itself takes 63 s in `schemas_at_path`; a composed `allOf` of three does not finish in 400 s. This lands first because every task after it adds tests over cyclic fixtures.
 
 **Files:**
-- Modify: `crates/taplo-common/src/schema/mod.rs` (`schemas_at_path`, `collect_schemas`, `possible_schemas_from`, `collect_child_schemas`, `ref_schema_value`)
+- Modify: `crates/taplo-common/src/schema/mod.rs` (`schemas_at_path`, `collect_schemas`, `possible_schemas_from`, `collect_child_schemas`, `ref_schema_value`, `condition_holds`)
 - Test: `crates/taplo-common/src/schema/tests.rs`
 
 **Interfaces:**
@@ -42,89 +43,143 @@
 Append to `crates/taplo-common/src/schema/tests.rs`:
 
 ```rust
+/// Runs an async traversal on its own thread and runtime and panics with
+/// `what` when it has not finished inside `bound`.
+///
+/// `tokio::time::timeout` cannot bound a traversal: it never reaches an await
+/// point that yields to the runtime, so the timeout future never gets to run.
+fn assert_finishes_within<T, F, Fut>(
+    bound: std::time::Duration,
+    what: &'static str,
+    work: F,
+) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        drop(tx.send(runtime.block_on(work())));
+    });
+
+    rx.recv_timeout(bound).unwrap_or_else(|_| panic!("{what}"))
+}
+
 /// The composed-`allOf` branch merges its members instead of recursing on
 /// `$ref`, so a cycle whose nodes are reachable only as members is invisible to
-/// a check that only consults the visited set without feeding it.
-#[tokio::test]
-async fn a_cycle_through_composed_all_of_members_terminates() {
-    let (schemas, url) = seeded(json!({
-        "type": "object",
-        "properties": { "a": { "$ref": "#/definitions/a" } },
-        "definitions": {
-            "a": { "allOf": [{ "$ref": "#/definitions/b" }] },
-            "b": { "allOf": [{ "$ref": "#/definitions/c" }, { "$ref": "#/definitions/d" }] },
-            "c": { "allOf": [{ "$ref": "#/definitions/b" }] },
-            "d": { "allOf": [{ "$ref": "#/definitions/b" }] }
-        }
-    }))
-    .await;
-
-    tokio::time::timeout(
+/// a check that consults the visited set without ever feeding it.
+#[test]
+fn a_cycle_through_composed_all_of_members_terminates() {
+    assert_finishes_within(
         std::time::Duration::from_secs(5),
-        schemas.possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5),
+        "a cycle through merged allOf members did not terminate",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "type": "object",
+                "properties": { "a": { "$ref": "#/definitions/a" } },
+                "definitions": {
+                    "a": { "allOf": [{ "$ref": "#/definitions/b" }] },
+                    "b": { "allOf": [
+                        { "$ref": "#/definitions/c" },
+                        { "$ref": "#/definitions/d" },
+                        { "$ref": "#/definitions/e" }
+                    ] },
+                    "c": { "allOf": [{ "$ref": "#/definitions/b" }] },
+                    "d": { "allOf": [{ "$ref": "#/definitions/b" }] },
+                    "e": { "allOf": [{ "$ref": "#/definitions/b" }] }
+                }
+            }))
+            .await;
+
+            schemas
+                .possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5)
+                .await
+                .map(|found| found.len())
+        },
     )
-    .await
-    .expect("a cycle through merged allOf members did not terminate")
     .unwrap();
 }
 
-#[tokio::test]
-async fn a_three_way_any_of_cycle_terminates() {
-    let (schemas, url) = seeded(json!({
-        "type": "object",
-        "properties": { "node": { "$ref": "#/definitions/node" } },
-        "definitions": {
-            "node": { "anyOf": [
-                { "$ref": "#/definitions/node" },
-                { "$ref": "#/definitions/node" },
-                { "$ref": "#/definitions/node" }
-            ] }
-        }
-    }))
-    .await;
-
-    let keys = "node".parse::<Keys>().unwrap();
-
-    tokio::time::timeout(
+#[test]
+fn a_composed_all_of_cycle_terminates() {
+    assert_finishes_within(
         std::time::Duration::from_secs(5),
-        schemas.schemas_at_path(&url, &Value::Null, &keys),
+        "a composed allOf cycle did not terminate",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "type": "object",
+                "properties": { "node": { "$ref": "#/definitions/node" } },
+                "definitions": {
+                    "node": { "allOf": [
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" }
+                    ] }
+                }
+            }))
+            .await;
+
+            schemas
+                .possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5)
+                .await
+                .map(|found| found.len())
+        },
     )
-    .await
-    .expect("a three-way anyOf cycle did not terminate")
     .unwrap();
 }
 
-/// A document that references itself at every level, queried deep enough that
-/// the branching would show if the set were not consulted.
-#[tokio::test]
-async fn a_self_referential_document_terminates_at_depth() {
-    let (schemas, url) = seeded(json!({
-        "anyOf": [{ "$ref": "#" }, { "$ref": "#" }],
-        "properties": { "a": { "$ref": "#" } }
-    }))
-    .await;
-
-    let keys = "a.a.a.a.a.a.a.a".parse::<Keys>().unwrap();
-
-    tokio::time::timeout(
+#[test]
+fn a_three_way_any_of_cycle_terminates() {
+    assert_finishes_within(
         std::time::Duration::from_secs(5),
-        schemas.schemas_at_path(&url, &Value::Null, &keys),
+        "a three-way anyOf cycle did not terminate",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "type": "object",
+                "properties": { "node": { "$ref": "#/definitions/node" } },
+                "definitions": {
+                    "node": { "anyOf": [
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" }
+                    ] }
+                }
+            }))
+            .await;
+
+            let keys = "node".parse::<Keys>().unwrap();
+
+            schemas
+                .schemas_at_path(&url, &Value::Null, &keys)
+                .await
+                .map(|found| found.len())
+        },
     )
-    .await
-    .expect("a self-referential document did not terminate at depth 8")
     .unwrap();
 }
 ```
 
-`a_self_referential_document_terminates_at_depth` uses `$ref: "#"`, which does not resolve until Task 2. It will pass here for the wrong reason — the reference errors out — so it is written now and *re-checked* in Task 2, where it becomes a real termination test. Note that in its Step 2 output.
+Each closure returns `found.len()` rather than the schemas themselves, because `Keys` holds
+`rowan` nodes and is not `Send`, and `assert_finishes_within` moves its result across a
+thread boundary.
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls -- a_cycle_through_composed_all_of_members_terminates a_three_way_any_of_cycle_terminates a_self_referential_document_terminates_at_depth`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls -- a_cycle_through_composed_all_of_members_terminates a_composed_all_of_cycle_terminates a_three_way_any_of_cycle_terminates`
 
-Expected: `a_cycle_through_composed_all_of_members_terminates` and `a_three_way_any_of_cycle_terminates` fail with the panic message from `.expect(...)`, after roughly five seconds each — that is the timeout firing, which is the right failure. `a_self_referential_document_terminates_at_depth` passes, because `$ref: "#"` errors before any work happens.
+Expected: all three fail after roughly five seconds each, with the message passed to
+`assert_finishes_within` — that is the bound firing, which is the right failure.
 
-If either of the first two fails instantly with a different message, the fixture is wrong, not the code.
+A test that fails instantly with a different message means the fixture is wrong, not the
+code. A test that runs for a minute and then reports `No such file or directory` means the
+bound is not being enforced: the traversal is on the test's own thread, where nothing can
+stop it, and the LRU has expired underneath it.
 
 - [ ] **Step 3: Give `ref_schema_value` its URL back**
 
@@ -159,6 +214,17 @@ In `crates/taplo-common/src/schema/mod.rs`, change `ref_schema_value` to return 
         }
     }
 ```
+
+`condition_holds` is its other caller and destructures the old return type, so it stops
+compiling here. Change its one line:
+
+```rust
+        let condition = resolved.as_ref().map_or(condition, |(_, schema)| &**schema);
+```
+
+replacing `let condition = resolved.as_deref().unwrap_or(condition);`. Without this the
+build fails at that line with `E0599: as_deref exists for Option<(Url, Arc<Value>)> but its
+trait bounds were not satisfied`.
 
 - [ ] **Step 4: Add the visited set to both traversals**
 
@@ -290,13 +356,16 @@ Its composed-`allOf` branch both consults and feeds the set. A member already on
                 visited.truncate(visited.len() - merged_count);
 ```
 
+This arm changes twice more: the tuple gains the target's base in Task 3, and Task 5 makes
+each member's own references absolute before merging it. Neither belongs here.
+
 Its `properties` loop starts a fresh set, beside the `MAX_COMPOSITION_DEPTH` it already resets. `possible_schemas_from` passes a fresh set per schema.
 
 - [ ] **Step 5: Run the tests and watch them pass**
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
-Expected: PASS, all 42 tests. If `mutually_referential_all_of_terminates` or `self_referential_all_of_terminates` now returns a *different* set of schemas rather than merely faster, stop: the set is suppressing a reference it should follow, which means a `pop` is missing.
+Expected: PASS. If `mutually_referential_all_of_terminates` or `self_referential_all_of_terminates` now returns a *different* set of schemas rather than merely faster, stop: the set is suppressing a reference it should follow, which means a `pop` is missing.
 
 - [ ] **Step 6: Run the whole workspace and the wasm check**
 
@@ -497,6 +566,45 @@ async fn a_fragment_is_percent_decoded_and_unescaped() {
     }
 }
 
+#[test]
+fn a_relative_reference_under_an_https_base_joins_to_https() {
+    let base = Url::parse("https://example.com/schemas/root.json").unwrap();
+
+    assert_eq!(
+        reference_url(&base, "common.json#/definitions/port")
+            .unwrap()
+            .as_str(),
+        "https://example.com/schemas/common.json#/definitions/port"
+    );
+}
+
+/// A document that references itself at every level, queried deep enough that
+/// the branching would show if the visited set were not consulted. It belongs
+/// here rather than with the other cycle tests, because `$ref: "#"` does not
+/// resolve at all until this task lands.
+#[test]
+fn a_self_referential_document_terminates_at_depth() {
+    assert_finishes_within(
+        std::time::Duration::from_secs(5),
+        "a self-referential document did not terminate at depth 8",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "anyOf": [{ "$ref": "#" }, { "$ref": "#" }],
+                "properties": { "a": { "$ref": "#" } }
+            }))
+            .await;
+
+            let keys = "a.a.a.a.a.a.a.a".parse::<Keys>().unwrap();
+
+            schemas
+                .schemas_at_path(&url, &Value::Null, &keys)
+                .await
+                .map(|found| found.len())
+        },
+    )
+    .unwrap();
+}
+
 /// Traversal applies a fragment as a JSON pointer to the raw document, so the
 /// name of the definition container is a key like any other and no draft is
 /// consulted. Pinned so a later change to fragment handling cannot break it
@@ -540,6 +648,8 @@ Expected: `defs_and_definitions_resolve_under_every_draft` PASSES — `$defs` al
 - `a_relative_reference_resolves_against_the_document`, `a_reference_walks_out_of_the_document_directory` — `called Result::unwrap() on an Err value: could not determine schema URL`.
 - `an_absolute_reference_carrying_a_pointer_resolves`, `a_reference_to_the_whole_document_resolves` — `failed to resolve relative schema`.
 - `a_fragment_is_percent_decoded_and_unescaped` — the `spaced` case fails to resolve; the `slashed` case may pass, since `~1` survives today's path.
+- `a_relative_reference_under_an_https_base_joins_to_https` — `called Option::unwrap() on a None value`.
+- `a_self_referential_document_terminates_at_depth` — the traversal errors on `$ref: "#"`, so the closure returns `Err` and `.unwrap()` panics. This is the one test here that fails for a reason other than the assertion; after Step 4 it terminates because the visited set stops it.
 
 - [ ] **Step 3: Replace `reference_url` with a join**
 
@@ -606,13 +716,8 @@ The recursion is now on the fragment-less URL only, so it is one level deep rath
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
-Expected: PASS, all 48 tests.
-
-Then re-check the Task 1 test that could not do its job yet:
-
-Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls a_self_referential_document_terminates_at_depth`
-
-Expected: PASS, and now for the right reason — `$ref: "#"` resolves, so the visited set is what stops it. If it times out, the set is not being consulted on the `#` shape.
+Expected: PASS. If `a_self_referential_document_terminates_at_depth` times out rather than
+passing, the visited set from Task 1 is not being consulted on the `#` shape.
 
 - [ ] **Step 6: Run the whole workspace and the wasm check**
 
@@ -653,7 +758,7 @@ EOF
 
 **Interfaces:**
 - Consumes: `reference_url(base, reference)` from Task 2.
-- Produces: `async fn resolve_schema(&self, url: Url) -> Result<(Url, Arc<Value>), anyhow::Error>` — the base the target sits under, after every `$id` the pointer crossed, beside the value.
+- Produces: `async fn resolve_schema(&self, url: Url) -> Result<(Url, Arc<Value>), anyhow::Error>` — the base in force *around* the target: the document's URL joined with every `$id` the pointer walked *through*, not the target's own, which the traversal applies on entry.
 - Produces: `fn rebase(base: &Url, schema: &Value) -> Option<Url>` — the base a schema object's `$id` establishes, or `None` when it declares none.
 - Produces: the first parameter of both traversals is renamed `base_url` and now varies.
 
@@ -785,11 +890,14 @@ fn rebase(base: &Url, schema: &Value) -> Option<Url> {
 Collect an `$id` from every object the pointer walks through, and hand the caller the base it arrived at:
 
 ```rust
-    /// The schema at `url`, with the base that applies inside it.
+    /// The schema at `url`, with the base in force *around* it.
     ///
     /// A JSON pointer may cross objects that carry `$id`, each of which
-    /// re-bases what lies beneath it, so the base a target sits under is the
-    /// document's own base joined with every `$id` on the way down.
+    /// re-bases what lies beneath it, so the base is the document's URL joined
+    /// with every `$id` the pointer walked *through*. The target's own `$id` is
+    /// deliberately not applied: every consumer re-bases on entry, and applying
+    /// it here as well would join it twice — `{"$id": "defs/"}` would resolve a
+    /// sibling reference against `defs/defs/`.
     #[must_use]
     pub(crate) async fn resolve_schema(
         &self,
@@ -801,11 +909,9 @@ Collect an `$id` from every object the pointer walks through, and hand the calle
         let document = self.load_schema(&document_url).await?;
         drop(self.cache.store(document_url.clone(), document.clone()));
 
-        let mut base = rebase(&document_url, &document).unwrap_or(document_url);
-
         let fragment = url.fragment().unwrap_or_default();
         if fragment.is_empty() {
-            return Ok((base, document));
+            return Ok((document_url, document));
         }
 
         let pointer = percent_encoding::percent_decode_str(fragment)
@@ -816,9 +922,17 @@ Collect an `$id` from every object the pointer walks through, and hand the calle
             return Err(anyhow!("could not resolve reference fragment `{pointer}`"));
         }
 
+        let mut base = document_url;
         let mut target = &*document;
 
         for token in pointer.split('/').skip(1) {
+            // The `$id` of an object the pointer passes *through* re-bases what
+            // lies below it. The one on the object the pointer lands on is left
+            // to the traversal, which re-bases on entry.
+            if let Some(rebased) = rebase(&base, target) {
+                base = rebased;
+            }
+
             let token = token.replace("~1", "/").replace("~0", "~");
 
             target = match target {
@@ -827,10 +941,6 @@ Collect an `$id` from every object the pointer walks through, and hand the calle
                 _ => None,
             }
             .ok_or_else(|| anyhow!("failed to resolve reference `{url}`"))?;
-
-            if let Some(rebased) = rebase(&base, target) {
-                base = rebased;
-            }
         }
 
         Ok((base, Arc::new(target.clone())))
@@ -881,7 +991,12 @@ At the `$ref` arm of `collect_schemas`, the resolved base replaces the current o
     ) -> Option<(Url, Url, Arc<Value>)> {
 ```
 
-returning `(reference_url, target_base, value)`. Its two callers in `collect_child_schemas` — the `$ref` arm and the composed-`allOf` merge — take the base from it; the merge keeps `base_url` for the merged value, because a merged object is not any one member's document.
+returning `(reference_url, target_base, value)`. `condition_holds` destructures it and has to
+follow, or the build fails at that line:
+
+```rust
+        let condition = resolved.as_ref().map_or(condition, |(_, _, schema)| &**schema);
+``` Its two callers in `collect_child_schemas` — the `$ref` arm and the composed-`allOf` merge — take the base from it; the merge keeps `base_url` for the merged value, because a merged object is not any one member's document.
 
 Every other recursion passes `base_url` unchanged, including the path-consuming ones: a property descent stays in the document it is written in.
 
@@ -889,7 +1004,7 @@ Every other recursion passes `base_url` unchanged, including the path-consuming 
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
-Expected: PASS, all 51 tests.
+Expected: PASS.
 
 - [ ] **Step 7: Run the whole workspace and the wasm check**
 
@@ -1017,10 +1132,11 @@ fn anchored_subschema<'d>(
 ) -> Option<(Url, &'d Value)> {
     let declared = document["$id"].as_str().and_then(|id| base.join(id).ok());
 
+    // The base returned is the one in force *around* the match, not the one its
+    // own `$id` establishes: the traversal re-bases on entry, and applying it
+    // here as well would join it twice.
     if declared.as_ref() == Some(url) {
-        let mut inner = declared.clone().unwrap();
-        inner.set_fragment(None);
-        return Some((inner, document));
+        return Some((base.clone(), document));
     }
 
     let base = declared.map_or_else(
@@ -1050,19 +1166,21 @@ In `resolve_schema`, replace the error arm for a non-pointer fragment:
 
 ```rust
         if !pointer.starts_with('/') {
-            return anchored_subschema(&document, &base, &url)
+            return anchored_subschema(&document, &document_url, &url)
                 .map(|(anchor_base, schema)| (anchor_base, Arc::new(schema.clone())))
                 .ok_or_else(|| anyhow!("failed to resolve reference `{url}`"));
         }
 ```
 
-`url` here is the reference's full URL, fragment included, which is the canonical URI an `$id` has to match.
+`url` here is the reference's full URL, fragment included, which is the canonical URI an
+`$id` has to match. The base handed in is the *document's* URL rather than a pre-rebased one,
+because `anchored_subschema` applies the root `$id` itself on its first step.
 
 - [ ] **Step 5: Run the tests and watch them pass**
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
-Expected: PASS, all 53 tests.
+Expected: PASS.
 
 - [ ] **Step 6: Run the whole workspace and the wasm check**
 
@@ -1232,6 +1350,47 @@ async fn a_sibling_unevaluated_properties_applies() {
     assert_eq!(descriptions(&found), ["anything else"]);
 }
 
+/// A composed-`allOf` member is merged rather than recursed into, so it never
+/// reaches the entry that re-bases. Its own pointers have to be made absolute
+/// against its own document before the merge, or they resolve against the
+/// carrier's.
+#[tokio::test]
+async fn a_composed_all_of_member_keeps_its_own_document() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "description": "carrier",
+                        "allOf": [{ "$ref": "sub/server.json" }]
+                    }
+                }
+            }),
+        ),
+        (
+            "sub/server.json",
+            json!({
+                "type": "object",
+                "properties": { "name": { "$ref": "#/definitions/name" } },
+                "definitions": {
+                    "name": { "description": "member name", "type": "string" }
+                }
+            }),
+        ),
+    ])
+    .await;
+
+    let children = schemas
+        .possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5)
+        .await
+        .unwrap();
+
+    let name = schema_at(&children, "server.name").expect("no schema for `server.name`");
+    assert_eq!(name["description"], "member name", "got {name}");
+}
+
 /// `$defs` beside a `$ref` is not an applicable sibling: it is where the
 /// reference points, not a keyword describing the instance. The root shape
 /// `pydantic` emits stays on the fast path.
@@ -1313,7 +1472,12 @@ Add `world_with_documents` to `crates/taplo-lsp/src/handlers/hover.rs`'s `mod te
     }
 ```
 
-Keep the existing body of `world_with` intact except for its schema seeding, which becomes a single-element call:
+`world_with_documents` takes over the whole body of the current `world_with`, including its
+`DocumentState` construction and its doc comment about `Cache::store` and
+`NativeEnvironment::new` — move them rather than retyping them, after reading the current
+function with `rg -n -A 40 "async fn world_with" crates/taplo-lsp/src/handlers/hover.rs`.
+`world_with` then becomes a one-line call, and since `base.join("schema.json")` produces the
+`file:///taplo-test/schema.json` it seeded before, every existing test is unaffected:
 
 ```rust
     pub(crate) async fn world_with(
@@ -1323,8 +1487,6 @@ Keep the existing body of `world_with` intact except for its schema seeding, whi
         world_with_documents(&[("schema.json", schema)], source).await
     }
 ```
-
-The existing `world_with` seeds `file:///taplo-test/schema.json`, which `base.join("schema.json")` produces, so every existing test is unaffected. Copy the `DocumentState` construction from the current `world_with` verbatim rather than retyping it — read it first with `rg -n "DocumentState" crates/taplo-lsp/src/handlers/hover.rs`.
 
 Then append a hover test to `crates/taplo-lsp/src/handlers/hover.rs`'s `mod tests`:
 
@@ -1352,11 +1514,21 @@ Then append a hover test to `crates/taplo-lsp/src/handlers/hover.rs`'s `mod test
     }
 ```
 
-Give the completion helpers the same multi-document variant. Read `complete_at_line` in
-`hover.rs`'s `mod tests` first — it builds a world, calls the `completion` handler and
-returns `Vec<CompletionItem>` — then add beside it:
+Give the completion helpers the same multi-document variant. The body of the current
+`complete_at_line`, everything after its `world_with` call, moves into a private
+`complete_in`; the two public helpers then differ only in how they build the world:
 
 ```rust
+    pub(crate) async fn complete_at_line(
+        schema: serde_json::Value,
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> Vec<lsp_types::CompletionItem> {
+        let (world, document_url) = world_with(schema, source).await;
+        complete_in(world, document_url, line, character).await
+    }
+
     /// Returns the completion items the handler produces at a position, for a
     /// document whose schema is spread across several files.
     pub(crate) async fn complete_at_documents(
@@ -1368,11 +1540,22 @@ returns `Vec<CompletionItem>` — then add beside it:
         let (world, document_url) = world_with_documents(schemas, source).await;
         complete_in(world, document_url, line, character).await
     }
+
+    /// Runs the completion handler against a world that is already built.
+    async fn complete_in(
+        world: Arc<WorldState<NativeEnvironment>>,
+        document_url: Url,
+        line: u32,
+        character: u32,
+    ) -> Vec<lsp_types::CompletionItem> {
+        // the body of the current `complete_at_line`, from its `completion(...)`
+        // call to the end, unchanged
+    }
 ```
 
-where `complete_in` is the body of the existing `complete_at_line` after its `world_with`
-call, extracted so both share it. `complete_at_line` becomes
-`complete_in(world_with(schema, source).await.0, …)` with the URL it also returns.
+`complete_in` stays private; `completion.rs`'s test module reaches `complete_at_documents`
+through `super::super::hover::tests::`, because both the module and the function are
+`pub(crate)`.
 
 Then a completion test in `crates/taplo-lsp/src/handlers/completion.rs`'s `mod tests`:
 
@@ -1421,7 +1604,12 @@ cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Carg
 cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-lsp --lib handlers
 ```
 
-Expected: `a_defs_container_beside_a_ref_is_not_a_sibling` and `offers_keys_of_a_target_reached_by_a_relative_reference` PASS (Tasks 2 and 3 made the second one work). The rest fail on the sibling being dropped: `a_sibling_description_wins_over_the_target` reports `["the target"]`, `a_sibling_unevaluated_properties_applies` reports `[]`, `renders_a_description_written_beside_a_ref` finds `An integer.`
+Expected: `a_defs_container_beside_a_ref_is_not_a_sibling` and `offers_keys_of_a_target_reached_by_a_relative_reference` PASS — Tasks 2 and 3 made the second one work. The rest fail:
+
+- `a_sibling_description_wins_over_the_target` reports `["the target"]`.
+- `a_sibling_unevaluated_properties_applies` reports `[]`.
+- `renders_a_description_written_beside_a_ref` finds `An integer.`
+- `a_composed_all_of_member_keeps_its_own_document` finds the raw `{"$ref": "#/definitions/name"}` where it wants `"member name"`, because the member's pointer resolved against the carrier's document.
 
 - [ ] **Step 4: Write the three helpers**
 
@@ -1586,6 +1774,21 @@ unresolvable reference stays the `Err` it is today, and folds the result:
 `&merged` is an `&Arc<Value>` where an `&Value` is wanted, which the deref coercion supplies
 — the same shape the arm already had.
 
+The composed-`allOf` merge in `collect_child_schemas` needs one more change, because a
+member is merged rather than recursed into and so never reaches the entry that re-bases.
+Its references are written in *its* document, and the merged value is traversed under the
+carrier's, so they are made absolute before the merge:
+
+```rust
+                        Some((url, target_base, resolved)) => {
+                            if visited.contains(&url) || merged_urls.contains(&url) {
+                                continue;
+                            }
+                            merged_urls.push(url);
+                            merged_all_of.merge(&absolute_refs(&resolved, &target_base));
+                        }
+```
+
 `ref_schema_value` folds too, which gives the `$ref` arm of `collect_child_schemas` and its
 composed-`allOf` merge the sibling behavior without a second copy of the rule:
 
@@ -1619,9 +1822,9 @@ cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Carg
 cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-lsp --lib handlers
 ```
 
-Expected: PASS. 59 tests in `taplo-common`; the `taplo-lsp` handler suites gain two and lose none.
+Expected: PASS. The `taplo-lsp` handler suites gain two tests and lose none.
 
-If `composed_all_of_ref_resolves_to_child_schema` fails, the overlay is being applied where the composed merge already applies one — check that `sibling_overlay` is returning `None` for a bare `{"$ref": …}` member.
+If `composed_all_of_ref_resolves_to_child_schema` fails, the overlay is being applied where the composed merge already applies one — check that `sibling_overlay` returns `None` for a bare `{"$ref": …}` member.
 
 - [ ] **Step 7: Run the whole workspace and the wasm check**
 
@@ -1859,7 +2062,7 @@ Remove the `names_a_ref` function from `crates/taplo-common/src/schema/mod.rs` e
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
-Expected: PASS, 61 tests.
+Expected: PASS.
 
 If `a_condition_holding_an_unresolvable_reference_takes_both_branches` fails with one branch, the `Resolver` arm is not firing — check that `load_schema` on a `file://` URL that does not exist returns `Err` rather than hanging.
 
@@ -2102,7 +2305,7 @@ fn scoped_to(schema_url: &Url, schema: &Value) -> Option<Value> {
 
 Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
-Expected: PASS, 64 tests.
+Expected: PASS.
 
 If `traversal_and_validation_agree_on_every_reference_shape` fails at `anchor` on the validation side, check that the fixture's `$id: "#port"` sits under `definitions.anchored` — `jsonschema` indexes it wherever it is, but only if the root scope is absolute, which is what this task supplies.
 
@@ -2116,7 +2319,7 @@ cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Carg
 cargo check --target wasm32-unknown-unknown --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/crates/taplo-wasm/Cargo.toml
 ```
 
-Expected: clean, with the two inherited `dead_code` warnings. The hover suite is 58 tests, one more than the baseline's 57.
+Expected: clean, with the two inherited `dead_code` warnings. `handlers::hover` gains one test over the baseline's 57 and `handlers::completion` gains one.
 
 - [ ] **Step 6: Format and commit**
 
@@ -2155,7 +2358,7 @@ cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/Carg
 cargo check --target wasm32-unknown-unknown --manifest-path /home/lev/Git/lev/taplo-wt/schema-ref-resolution/crates/taplo-wasm/Cargo.toml
 ```
 
-`git status` must be empty. The workspace check and test must be clean. `taplo-common`'s schema suite grows from 39 to 64; `handlers::hover` from 57 to 58, and `handlers::completion` by one.
+`git status` must be empty. The workspace check and test must be clean. Every test in `taplo-common`'s schema suite passes, and it is substantially larger than the baseline's 39; `handlers::hover` grows from 57 to 58 and `handlers::completion` by one. No test from the baseline is removed or weakened, with one deliberate exception: `a_condition_holding_a_nested_reference_takes_both_branches` becomes `a_condition_holding_a_nested_reference_decides_its_branch` in Task 6.
 
 Nobody follows this feature set, so three things belong on the tracking issue when it is updated:
 
