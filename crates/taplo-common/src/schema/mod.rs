@@ -524,13 +524,14 @@ impl<E: Environment> Schemas<E> {
                 return Ok(false);
             }
 
-            let (target_base, schema) = self.resolve_schema(url.clone()).await?;
+            let (target_base, target) = self.resolve_schema(url.clone()).await?;
+            let merged = self.fold_siblings(target, schema, base_url);
 
             visited.push(url);
             let evaluated = self
                 .collect_schemas(
                     &target_base,
-                    &schema,
+                    &merged,
                     value,
                     full_path.clone(),
                     path,
@@ -899,12 +900,12 @@ impl<E: Environment> Schemas<E> {
 
                 for all_of in all_ofs {
                     match self.ref_schema_value(base_url, all_of).await {
-                        Some((url, _, resolved)) => {
+                        Some((url, target_base, resolved)) => {
                             if visited.contains(&url) || merged_urls.contains(&url) {
                                 continue;
                             }
                             merged_urls.push(url);
-                            merged_all_of.merge(&resolved);
+                            merged_all_of.merge(&absolute_refs(&resolved, &target_base));
                         }
                         None => merged_all_of.merge(all_of),
                     }
@@ -983,12 +984,32 @@ impl<E: Environment> Schemas<E> {
             }
         };
 
-        match self.resolve_schema(url.clone()).await {
-            Ok((target_base, s)) => Some((url, target_base, s)),
+        let (target_base, target) = match self.resolve_schema(url.clone()).await {
+            Ok(resolved) => resolved,
             Err(error) => {
                 tracing::error!(?error, "failed to resolve schema");
-                None
+                return None;
             }
+        };
+
+        Some((
+            url,
+            target_base,
+            self.fold_siblings(target, schema, base_url),
+        ))
+    }
+
+    /// `target` with the keywords written beside the `$ref` that named it
+    /// merged over the top.
+    ///
+    /// The overlay's own references are written in the carrier's document, so
+    /// they are made absolute against the carrier's base before the merge. The
+    /// merged value is then traversed under the target's base, which is where
+    /// everything the target itself wrote belongs.
+    fn fold_siblings(&self, target: Arc<Value>, carrier: &Value, base_url: &Url) -> Arc<Value> {
+        match sibling_overlay(carrier) {
+            Some(overlay) => Arc::new(merged_over(&target, &absolute_refs(&overlay, base_url))),
+            None => target,
         }
     }
 }
@@ -1088,6 +1109,107 @@ fn names_a_ref(schema: &Value) -> bool {
 /// cannot be one, which no scheme reaching `fetch_external` produces.
 fn reference_url(base: &Url, reference: &str) -> Option<Url> {
     base.join(reference).ok()
+}
+
+/// The keywords beside a `$ref` that describe the instance, or `None` when the
+/// object carries only the reference and its own identity.
+///
+/// `$id`, `$anchor` and `$schema` identify the carrier rather than describe an
+/// instance, and carrying one into the target would re-base the target's own
+/// references onto the carrier's document. `definitions` and `$defs` hold what
+/// the reference points *at*, so an object that carries only those — the root
+/// shape `pydantic` and `schemars` emit — stays on the fast path.
+fn sibling_overlay(schema: &Value) -> Option<Value> {
+    const NOT_A_SIBLING: [&str; 7] = [
+        "$ref",
+        "$id",
+        "$anchor",
+        "$schema",
+        "$comment",
+        "definitions",
+        "$defs",
+    ];
+
+    let map = schema.as_object()?;
+
+    let overlay: serde_json::Map<_, _> = map
+        .iter()
+        .filter(|(k, _)| !NOT_A_SIBLING.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    (!overlay.is_empty()).then(|| Value::Object(overlay))
+}
+
+/// `overlay`'s keys win over `base`'s.
+///
+/// Where both hold an object the two merge recursively, which is what carries
+/// `properties`, `patternProperties`, `dependentSchemas` and `x-taplo` — a
+/// sibling `x-taplo.docs` lands beside the target's `x-taplo.links` rather than
+/// erasing it. `const` and `default` are the exception: their objects are
+/// instance data, and merging them would compose a value nobody wrote.
+/// `required` is the union of both, because a validator applying both enforces
+/// both and a sibling `required` was written to add an obligation, not to
+/// cancel one. Every other array is replaced.
+fn merged_over(base: &Value, overlay: &Value) -> Value {
+    let (Some(base_map), Some(overlay_map)) = (base.as_object(), overlay.as_object()) else {
+        return overlay.clone();
+    };
+
+    let mut merged = base_map.clone();
+
+    for (key, value) in overlay_map {
+        let merged_value = match (merged.get(key), key.as_str()) {
+            (Some(Value::Array(existing)), "required") => {
+                let mut union = existing.clone();
+                for item in value.as_array().into_iter().flatten() {
+                    if !union.contains(item) {
+                        union.push(item.clone());
+                    }
+                }
+                Value::Array(union)
+            }
+            (Some(existing), key) if key != "const" && key != "default" => {
+                merged_over(existing, value)
+            }
+            _ => value.clone(),
+        };
+
+        merged.insert(key.clone(), merged_value);
+    }
+
+    Value::Object(merged)
+}
+
+/// A copy of `schema` whose every `$ref` string is absolute against `base`.
+///
+/// A subschema evaluated outside its document keeps its `#/...` pointers and
+/// loses the document they name, so every reference fails to resolve. The walk
+/// covers the subschema's own JSON and follows nothing, so it terminates
+/// however cyclic the schema it came from is. A nested `$id` re-bases the
+/// references beneath it, as it does in traversal. A reference that cannot be
+/// joined is left as written.
+fn absolute_refs(schema: &Value, base: &Url) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let base = rebase(base, schema).unwrap_or_else(|| base.clone());
+
+            Value::Object(
+                map.iter()
+                    .map(|(key, value)| {
+                        let value = match (key.as_str(), value.as_str()) {
+                            ("$ref", Some(reference)) => reference_url(&base, reference)
+                                .map_or_else(|| value.clone(), |u| Value::String(u.into())),
+                            _ => absolute_refs(value, &base),
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(|i| absolute_refs(i, base)).collect()),
+        other => other.clone(),
+    }
 }
 
 /// How a schema's `$schema` value maps onto a draft taplo can validate against.

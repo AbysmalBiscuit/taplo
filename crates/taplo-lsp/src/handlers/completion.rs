@@ -1005,4 +1005,39 @@ mod tests {
         assert!(labels(&items).contains(&"image"));
         assert!(!labels(&items).contains(&"binary"));
     }
+
+    #[tokio::test]
+    async fn offers_keys_of_a_target_reached_by_a_relative_reference() {
+        let items = super::super::hover::tests::complete_at_documents(
+            &[
+                (
+                    "schema.json",
+                    json!({
+                        "type": "object",
+                        "properties": { "server": { "$ref": "sub/server.json" } }
+                    }),
+                ),
+                (
+                    "sub/server.json",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "host": { "type": "string" },
+                            "port": { "type": "integer" }
+                        }
+                    }),
+                ),
+            ],
+            "[server]\n",
+            1,
+            0,
+        )
+        .await;
+
+        let labels = labels(&items);
+        assert!(
+            labels.contains(&"host") && labels.contains(&"port"),
+            "got {labels:?}"
+        );
+    }
 }

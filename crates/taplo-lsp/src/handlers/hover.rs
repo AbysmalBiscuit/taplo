@@ -815,35 +815,43 @@ pub(crate) mod tests {
 
     use crate::world::{DocumentState, WorldState};
 
-    /// Builds a world holding one document and one schema associated with it.
+    /// Builds a world holding one document and several schemas, the first of
+    /// which is associated with the document. Schema paths are relative to
+    /// `file:///taplo-test/`.
     ///
     /// `Cache::store` reports an error when no disk cache path is set but has
     /// already populated the in-memory cache, which is all a test needs.
     /// `NativeEnvironment::new` requires an active tokio runtime, so every
     /// caller must be a `#[tokio::test]`.
-    pub(crate) async fn world_with(
-        schema: serde_json::Value,
+    pub(crate) async fn world_with_documents(
+        schemas: &[(&str, serde_json::Value)],
         source: &str,
     ) -> (Arc<WorldState<NativeEnvironment>>, Url) {
         let world = Arc::new(WorldState::new(NativeEnvironment::new()));
         let document_url: Url = "root:///test.toml".parse().unwrap();
-        let schema_url: Url = "file:///taplo-test/schema.json".parse().unwrap();
+        let base: Url = "file:///taplo-test/".parse().unwrap();
 
         {
             let mut workspaces = world.workspaces.write().await;
             let ws = workspaces.by_document_mut(&document_url);
 
-            drop(
-                ws.schemas
-                    .cache()
-                    .store(schema_url.clone(), Arc::new(schema))
-                    .await,
-            );
+            let mut root = None;
+
+            for (path, schema) in schemas {
+                let url = base.join(path).unwrap();
+                drop(
+                    ws.schemas
+                        .cache()
+                        .store(url.clone(), Arc::new(schema.clone()))
+                        .await,
+                );
+                root.get_or_insert(url);
+            }
 
             ws.schemas.associations().add(
                 AssociationRule::glob("**/*.toml").unwrap(),
                 SchemaAssociation {
-                    url: schema_url,
+                    url: root.expect("no schemas seeded"),
                     meta: json!({ "source": source::MANUAL }),
                     priority: priority::MAX,
                 },
@@ -852,11 +860,19 @@ pub(crate) mod tests {
             let parse = taplo::parser::parse(source);
             let mapper = Mapper::new_utf16(source, false);
             let dom = parse.clone().into_dom();
+
             ws.documents
-                .insert(document_url.clone(), DocumentState { parse, dom, mapper });
+                .insert(document_url.clone(), DocumentState { parse, mapper, dom });
         }
 
         (world, document_url)
+    }
+
+    pub(crate) async fn world_with(
+        schema: serde_json::Value,
+        source: &str,
+    ) -> (Arc<WorldState<NativeEnvironment>>, Url) {
+        world_with_documents(&[("schema.json", schema)], source).await
     }
 
     /// Returns the markdown the hover handler produces at a position on line 0.
@@ -917,7 +933,28 @@ pub(crate) mod tests {
         character: u32,
     ) -> Vec<lsp_types::CompletionItem> {
         let (world, document_url) = world_with(schema, source).await;
+        complete_in(world, document_url, line, character).await
+    }
 
+    /// Returns the completion items the handler produces at a position, for a
+    /// document whose schema is spread across several files.
+    pub(crate) async fn complete_at_documents(
+        schemas: &[(&str, serde_json::Value)],
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> Vec<lsp_types::CompletionItem> {
+        let (world, document_url) = world_with_documents(schemas, source).await;
+        complete_in(world, document_url, line, character).await
+    }
+
+    /// Runs the completion handler against a world that is already built.
+    async fn complete_in(
+        world: Arc<WorldState<NativeEnvironment>>,
+        document_url: Url,
+        line: u32,
+        character: u32,
+    ) -> Vec<lsp_types::CompletionItem> {
         let response = crate::handlers::completion(
             lsp_async_stub::Context::detached(world),
             Some(lsp_types::CompletionParams {
@@ -1823,6 +1860,28 @@ pub(crate) mod tests {
         assert_eq!(
             hovered.as_deref(),
             Some("- Must not match\n  - One of: `\"debug\"`, `\"trace\"`")
+        );
+    }
+
+    #[tokio::test]
+    async fn renders_a_description_written_beside_a_ref() {
+        let hovered = hover_at(
+            json!({
+                "type": "object",
+                "properties": {
+                    "port": { "$ref": "#/definitions/port", "description": "The port to bind." }
+                },
+                "definitions": { "port": { "description": "An integer.", "type": "integer" } }
+            }),
+            "port = 8080",
+            1,
+        )
+        .await
+        .expect("no hover");
+
+        assert!(
+            hovered.contains("The port to bind."),
+            "expected the sibling description, got {hovered}"
         );
     }
 }

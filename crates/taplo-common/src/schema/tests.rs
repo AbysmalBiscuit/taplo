@@ -1355,3 +1355,190 @@ async fn an_anchor_keyword_resolves_in_neither_half() {
         "expected an invalid-reference error, got {errors:?}"
     );
 }
+
+#[tokio::test]
+async fn a_sibling_description_wins_over_the_target() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "port": { "$ref": "#/definitions/port", "description": "the sibling" }
+        },
+        "definitions": {
+            "port": { "description": "the target", "type": "integer" }
+        }
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["the sibling"]);
+    assert_eq!(found[0].1["type"], "integer");
+    assert_eq!(found.len(), 1, "the carrier and the target are one schema");
+}
+
+#[tokio::test]
+async fn a_sibling_enum_replaces_the_target_enum() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": { "kind": { "$ref": "#/definitions/kind", "enum": ["a"] } },
+        "definitions": { "kind": { "type": "string", "enum": ["b", "c"] } }
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"kind".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(found[0].1["enum"], json!(["a"]));
+}
+
+#[tokio::test]
+async fn a_sibling_required_unions_with_the_target() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "server": { "$ref": "#/definitions/server", "required": ["extra"] }
+        },
+        "definitions": { "server": { "type": "object", "required": ["name"] } }
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"server".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    let required = found[0].1["required"].as_array().unwrap();
+    assert!(required.contains(&json!("name")) && required.contains(&json!("extra")));
+}
+
+#[tokio::test]
+async fn sibling_properties_union_with_the_target() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "$ref": "sub/server.json",
+                        "properties": { "extra": { "$ref": "#/definitions/extra" } }
+                    }
+                },
+                "definitions": { "extra": { "description": "sibling extra", "type": "string" } }
+            }),
+        ),
+        (
+            "sub/server.json",
+            json!({
+                "type": "object",
+                "properties": { "name": { "description": "target name", "type": "string" } }
+            }),
+        ),
+    ])
+    .await;
+
+    for (path, expected) in [
+        ("server.extra", "sibling extra"),
+        ("server.name", "target name"),
+    ] {
+        let found = schemas
+            .schemas_at_path(&url, &Value::Null, &path.parse::<Keys>().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(descriptions(&found), [expected], "at `{path}`");
+    }
+}
+
+#[tokio::test]
+async fn a_sibling_unevaluated_properties_applies() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "obj": {
+                "$ref": "#/definitions/obj",
+                "unevaluatedProperties": { "description": "anything else", "type": "string" }
+            }
+        },
+        "definitions": {
+            "obj": { "type": "object", "properties": { "known": { "type": "string" } } }
+        }
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"obj.unknown".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["anything else"]);
+}
+
+/// A composed-`allOf` member is merged rather than recursed into, so it never
+/// reaches the entry that re-bases. Its own pointers have to be made absolute
+/// against its own document before the merge, or they resolve against the
+/// carrier's.
+#[tokio::test]
+async fn a_composed_all_of_member_keeps_its_own_document() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "description": "carrier",
+                        "allOf": [{ "$ref": "sub/server.json" }]
+                    }
+                }
+            }),
+        ),
+        (
+            "sub/server.json",
+            json!({
+                "type": "object",
+                "properties": { "name": { "$ref": "#/definitions/name" } },
+                "definitions": {
+                    "name": { "description": "member name", "type": "string" }
+                }
+            }),
+        ),
+    ])
+    .await;
+
+    let children = schemas
+        .possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5)
+        .await
+        .unwrap();
+
+    let name = schema_at(&children, "server.name").expect("no schema for `server.name`");
+    assert_eq!(name["description"], "member name", "got {name}");
+}
+
+/// `$defs` beside a `$ref` is not an applicable sibling: it is where the
+/// reference points, not a keyword describing the instance. The root shape
+/// `pydantic` emits stays on the fast path.
+#[tokio::test]
+async fn a_defs_container_beside_a_ref_is_not_a_sibling() {
+    let (schemas, url) = seeded(json!({
+        "$ref": "#/$defs/model",
+        "$defs": {
+            "model": {
+                "type": "object",
+                "properties": { "port": { "description": "the model", "type": "integer" } }
+            }
+        }
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["the model"]);
+}
