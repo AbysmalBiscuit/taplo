@@ -988,3 +988,225 @@ fn a_three_way_any_of_cycle_terminates() {
     )
     .unwrap();
 }
+
+/// Seeds several documents into the in-memory cache and returns the URL of the
+/// first, which is the root. Paths are relative to `file:///taplo-test/`.
+async fn seeded_documents(documents: &[(&str, Value)]) -> (Schemas<NativeEnvironment>, Url) {
+    let schemas = Schemas::new(NativeEnvironment::new(), reqwest::Client::new());
+    let base = Url::parse("file:///taplo-test/").unwrap();
+
+    let mut root = None;
+
+    for (path, document) in documents {
+        let url = base.join(path).unwrap();
+        drop(
+            schemas
+                .cache()
+                .store(url.clone(), Arc::new(document.clone()))
+                .await,
+        );
+        root.get_or_insert(url);
+    }
+
+    (schemas, root.expect("no documents seeded"))
+}
+
+#[tokio::test]
+async fn a_relative_reference_resolves_against_the_document() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": { "port": { "$ref": "common.json#/definitions/port" } }
+            }),
+        ),
+        (
+            "common.json",
+            json!({
+                "definitions": { "port": { "description": "relative", "type": "integer" } }
+            }),
+        ),
+    ])
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["relative"]);
+}
+
+#[tokio::test]
+async fn a_reference_walks_out_of_the_document_directory() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "nested/schema.json",
+            json!({
+                "type": "object",
+                "properties": {
+                    "up": { "$ref": "../common.json#/definitions/port" },
+                    "rooted": { "$ref": "/taplo-test/common.json#/definitions/port" }
+                }
+            }),
+        ),
+        (
+            "common.json",
+            json!({
+                "definitions": { "port": { "description": "shared", "type": "integer" } }
+            }),
+        ),
+    ])
+    .await;
+
+    for key in ["up", "rooted"] {
+        let found = schemas
+            .schemas_at_path(&url, &Value::Null, &key.parse::<Keys>().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(descriptions(&found), ["shared"], "at `{key}`");
+    }
+}
+
+#[tokio::test]
+async fn an_absolute_reference_carrying_a_pointer_resolves() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": {
+                    "port": { "$ref": "file:///taplo-test/common.json#/definitions/port" }
+                }
+            }),
+        ),
+        (
+            "common.json",
+            json!({
+                "definitions": { "port": { "description": "absolute", "type": "integer" } }
+            }),
+        ),
+    ])
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["absolute"]);
+}
+
+#[tokio::test]
+async fn a_reference_to_the_whole_document_resolves() {
+    let (schemas, url) = seeded(json!({
+        "description": "the root",
+        "type": "object",
+        "properties": { "child": { "$ref": "#" } }
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"child".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["the root"]);
+}
+
+#[tokio::test]
+async fn a_fragment_is_percent_decoded_and_unescaped() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "spaced": { "$ref": "#/definitions/two words" },
+            "slashed": { "$ref": "#/definitions/a~1b" }
+        },
+        "definitions": {
+            "two words": { "description": "spaced", "type": "integer" },
+            "a/b": { "description": "slashed", "type": "integer" }
+        }
+    }))
+    .await;
+
+    for (key, expected) in [("spaced", "spaced"), ("slashed", "slashed")] {
+        let found = schemas
+            .schemas_at_path(&url, &Value::Null, &key.parse::<Keys>().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(descriptions(&found), [expected], "at `{key}`");
+    }
+}
+
+#[test]
+fn a_relative_reference_under_an_https_base_joins_to_https() {
+    let base = Url::parse("https://example.com/schemas/root.json").unwrap();
+
+    assert_eq!(
+        reference_url(&base, "common.json#/definitions/port")
+            .unwrap()
+            .as_str(),
+        "https://example.com/schemas/common.json#/definitions/port"
+    );
+}
+
+/// A document that references itself at every level, queried deep enough that
+/// the branching would show if the visited set were not consulted. It belongs
+/// here rather than with the other cycle tests, because `$ref: "#"` does not
+/// resolve at all until this task lands.
+#[test]
+fn a_self_referential_document_terminates_at_depth() {
+    assert_finishes_within(
+        std::time::Duration::from_secs(5),
+        "a self-referential document did not terminate at depth 8",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "anyOf": [{ "$ref": "#" }, { "$ref": "#" }],
+                "properties": { "a": { "$ref": "#" } }
+            }))
+            .await;
+
+            let keys = "a.a.a.a.a.a.a.a".parse::<Keys>().unwrap();
+
+            schemas
+                .schemas_at_path(&url, &Value::Null, &keys)
+                .await
+                .map(|found| found.len())
+        },
+    )
+    .unwrap();
+}
+
+/// Traversal applies a fragment as a JSON pointer to the raw document, so the
+/// name of the definition container is a key like any other and no draft is
+/// consulted. Pinned so a later change to fragment handling cannot break it
+/// quietly.
+#[tokio::test]
+async fn defs_and_definitions_resolve_under_every_draft() {
+    for meta in [
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft/2019-09/schema",
+        "https://json-schema.org/draft/2020-12/schema",
+    ] {
+        let (schemas, url) = seeded(json!({
+            "$schema": meta,
+            "type": "object",
+            "properties": {
+                "new": { "$ref": "#/$defs/port" },
+                "old": { "$ref": "#/definitions/port" }
+            },
+            "$defs": { "port": { "description": "defs", "type": "integer" } },
+            "definitions": { "port": { "description": "definitions", "type": "integer" } }
+        }))
+        .await;
+
+        for (key, expected) in [("new", "defs"), ("old", "definitions")] {
+            let found = schemas
+                .schemas_at_path(&url, &Value::Null, &key.parse::<Keys>().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(descriptions(&found), [expected], "at `{key}` under {meta}");
+        }
+    }
+}

@@ -248,23 +248,37 @@ impl<E: Environment> Schemas<E> {
     #[async_recursion(?Send)]
     #[must_use]
     pub(crate) async fn resolve_schema(&self, url: Url) -> Result<Arc<Value>, anyhow::Error> {
-        match url.fragment() {
-            Some(fragment) => {
-                let mut res_url = url.clone();
-                res_url.set_fragment(None);
-                let schema = self.resolve_schema(res_url).await?;
-                let ptr = String::from("/") + fragment;
-                schema
-                    .pointer(&ptr)
-                    .map(|v| Arc::new(v.clone()))
-                    .ok_or_else(|| anyhow!("failed to resolve relative schema"))
-            }
-            None => {
-                let val = self.load_schema(&url).await?;
-                drop(self.cache.store(url, val.clone()));
-                Ok(val)
-            }
+        let fragment = url.fragment().unwrap_or_default();
+
+        // An absent or empty fragment names the whole document; a fragment
+        // starting with `/` is a JSON pointer. A URI fragment is
+        // percent-encoded and a JSON pointer is not, so it is decoded before
+        // use; `~0` and `~1` survive that untouched and `serde_json` unescapes
+        // them itself.
+        if fragment.is_empty() {
+            let mut document_url = url.clone();
+            document_url.set_fragment(None);
+            let val = self.load_schema(&document_url).await?;
+            drop(self.cache.store(document_url, val.clone()));
+            return Ok(val);
         }
+
+        let mut document_url = url.clone();
+        document_url.set_fragment(None);
+        let document = self.resolve_schema(document_url).await?;
+
+        let pointer = percent_encoding::percent_decode_str(fragment)
+            .decode_utf8()
+            .with_context(|| format!("reference fragment is not valid UTF-8: {fragment}"))?;
+
+        if !pointer.starts_with('/') {
+            return Err(anyhow!("could not resolve reference fragment `{pointer}`"));
+        }
+
+        document
+            .pointer(&pointer)
+            .map(|v| Arc::new(v.clone()))
+            .ok_or_else(|| anyhow!("failed to resolve reference `{url}`"))
     }
 
     fn create_validator(&self, schema: &Value) -> Result<JSONSchema, anyhow::Error> {
@@ -974,13 +988,15 @@ fn names_a_ref(schema: &Value) -> bool {
     }
 }
 
-fn reference_url(root_url: &Url, reference: &str) -> Option<Url> {
-    if !reference.starts_with('#') {
-        return Url::parse(reference).ok();
-    }
-    let mut url = root_url.clone();
-    url.set_fragment(Some(reference.trim_start_matches("#/")));
-    Some(url)
+/// The absolute URL a `$ref` denotes, resolved against the base in force where
+/// it is written.
+///
+/// This is RFC 3986 reference resolution, which `Url::join` implements: a
+/// fragment-only reference names this document, a relative path names a
+/// sibling, an absolute URL names itself. A join fails only for a base that
+/// cannot be one, which no scheme reaching `fetch_external` produces.
+fn reference_url(base: &Url, reference: &str) -> Option<Url> {
+    base.join(reference).ok()
 }
 
 /// How a schema's `$schema` value maps onto a draft taplo can validate against.
