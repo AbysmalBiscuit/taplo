@@ -1,6 +1,6 @@
 # JSON Schema `$ref` resolution
 
-**Status:** Draft
+**Status:** Accepted
 **Tracking issue:** AbysmalBiscuit/taplo#1, "`$ref` resolution" section
 
 ## Problem
@@ -277,9 +277,23 @@ fragment as written, leading `/` intact. So `resolve_schema` stops synthesizing 
 > A fragment is a JSON pointer when it starts with `/`, and a plain-name anchor otherwise.
 > An absent or empty fragment names the whole document.
 
-Percent-decoding comes with that, because a URI fragment is percent-encoded and a JSON
-pointer is not. `~0` and `~1` need no handling of their own: `serde_json`'s `pointer`
-already unescapes them.
+Percent-decoding is required, not optional: `Url::join` percent-*encodes* on the way in,
+so `#/a b` comes back as the fragment `/a%20b` and `#/café` as `/caf%C3%A9`. `~0` and
+`~1` survive the round trip untouched and need no handling of their own, because
+`serde_json`'s `pointer` already unescapes them.
+
+Three edges the join produces that the fragment rule has to name. An empty reference
+`""` is a legal self-reference and joins to the base minus its fragment, query intact.
+A query-only reference joins to a URL the cache is not keyed by, so it fetches; nothing
+in the checklist writes one, and fetching is the honest answer for a URL naming a
+different resource. And `#` joins to a URL whose fragment is `Some("")`, which is the
+whole document — the case that errors today, because `resolve_schema` builds the pointer
+`/` from it.
+
+`Url::join` fails on a cannot-be-a-base URL. Every scheme that reaches `fetch_external`
+— `http`, `https`, `file` — has an authority, and so does the one builtin,
+`taplo://taplo.toml`. A join that fails is treated as an unresolvable reference, the
+same as today.
 
 `root_url` becomes `base_url` in both traversal functions, and moves on exactly two events:
 
@@ -314,12 +328,20 @@ Bringing them into agreement needs one change on the validation side, because th
 
 > `add_validator` knows the URL the schema was loaded from. Before compiling, it makes the
 > root `$id` absolute against that URL — setting it when there is none, joining it when it
-> is relative, leaving it alone when it is already absolute.
+> is relative, leaving it alone when it is already absolute. For a root that compiles
+> as draft 4 the keyword written is `id`, because that is the one `jsonschema` reads
+> under that draft.
 
 Probed: the schema with a relative reference and no `$id` goes from
 ``Err("the scheme `json-schema` is not supported")`` to
 `Ok(["\"nope\" is not of type \"integer\""])`. It also repairs the relative-`$id` case,
-where compilation fails outright today.
+where compilation fails outright today. The draft-4 spelling is not optional — probed
+against the same fixture compiled as draft 4, writing `$id` leaves it erroring and
+writing `id` fixes it, because `id_of` reads only `id` under that draft. `add_validator`
+already knows the draft, through `declared_draft`.
+
+The "`$id` only" non-goal is about what traversal *reads* from a document. What the
+validator is *told* is a different question, and there the draft is known.
 
 This is not the same code path as traversal's base, and it is not meant to be. It is the one
 change that makes `jsonschema`'s own resolver start where traversal starts, after which the
@@ -367,21 +389,54 @@ doubles every value completion under the carrier, because `possible_schemas_from
 both, and `add_value_completions` deduplicates within one schema rather than across the set.
 A merge produces one schema and the question does not arise.
 
+The overlay is the referring object minus the keywords that identify it rather than
+describe its instance: `$ref` itself, `$id`, `$anchor`, `$schema`, `$comment`,
+`definitions` and `$defs`. Dropping `$ref` is what stops the merged value from resolving
+itself again; dropping `$id` is what stops the carrier's identity from re-basing the
+target's relative references to the carrier's directory; dropping the definition
+containers is what keeps `{"$ref": "#/$defs/model", "$defs": {...}}` — the root shape
+`pydantic` emits, which resolves correctly today — on the fast path instead of merging a
+document into its own subschema.
+
+So the fast path is "a `$ref` with no *applicable* sibling", and it is the common case:
+no siblings, no clone, no merge.
+
 The merge rule is written out rather than delegated:
 
 ```rust
-/// `overlay`'s keys win over `base`'s, except where both hold an object, which
-/// merge recursively.
+/// `overlay`'s keys win over `base`'s, except where both hold an object that
+/// describes a schema rather than an instance, which merge recursively.
+///
+/// `const`, `default`, `examples` and `enum` hold instance data, so an overlay
+/// replaces them whole. Merging them would compose a value nobody wrote.
 fn merged_over(base: &Value, overlay: &Value) -> Value
 ```
 
 `json_value_merge`'s `Merge`, which `collect_child_schemas` uses for its composed-`allOf`
-branch, is the wrong tool here. Probed: it concatenates arrays. Merging `{"enum": [1, 2]}`
-with `{"enum": [3]}` gives `{"enum": [1, 2, 3]}`, so a sibling `enum`, `required` or `type`
-beside a `$ref` would widen the target's rather than override it. Object-recursive with the
-overlay winning on everything else gives the two answers traversal needs: a sibling
-`description` replaces the target's, and a sibling `properties` unions with the target's,
-which is what a key lookup at that position wants.
+branch, is the wrong tool here. Probed: it concatenates arrays, so `{"enum": [1, 2]}`
+merged with `{"enum": [3]}` gives `{"enum": [1, 2, 3]}` and `{"required": ["a"]}` merged
+with itself gives `["a", "a"]`. A sibling `enum` beside a `$ref` would widen the target's
+rather than replace it.
+
+Replacing rather than intersecting is a choice, and the honest framing is that neither
+answer is the validator's. A 2019-09 validator applies both, so the instances that pass
+are the *intersection* — which for a sibling `enum` of `["a"]` over a target `enum` of
+`["b", "c"]` is empty. Traversal cannot offer an empty completion list as an answer, and
+the author who wrote the sibling meant it to narrow the target, so the sibling wins.
+Objects recurse for the opposite reason: a sibling `properties` unions with the target's,
+because a key described by either is a key the reader may write.
+
+The overlay is rewritten through `absolute_refs` against the *carrier's* base before the
+merge, and traversal continues into the merged value under the *target's* base. Without
+that rewrite a sibling `{"properties": {"extra": {"$ref": "#/definitions/x"}}}` written in
+the root document would resolve against the target's document instead of its own. The
+same bug sits in today's composed-`allOf` merge, unreachable only because a relative
+reference errored before it got there; the members it merges need the same rewrite.
+
+Two merges now exist and they compose in one order: `merged_over` runs *inside* a member,
+folding a `$ref`'s siblings into its target, and `json_value_merge`'s `Merge` runs
+*across* members in the composed-`allOf` branch, as it already does. Nothing changes about
+the second.
 
 Traversal honors siblings under every draft, where `jsonschema` honors them only from
 2019-09. That is deliberate, and it is the one place this feature set makes traversal more
@@ -390,9 +445,8 @@ generous than the validator. The generosity is confined to what traversal is for
 for a reader, and hiding it because a 2019 revision permits the validator to ignore it serves
 nobody. Where the sibling is an applicator, the union traversal produces is a superset of the
 branch, so the failure mode is offering a key that does not validate, which the applicator
-feature set already argued is the recoverable direction.
-
-`{"$ref": ...}` alone keeps the fast path: no siblings, no clone, no merge.
+feature set already argued is the recoverable direction. It is also what the VS Code JSON
+language service does, so a schema author sees the same keys in both editors.
 
 ### A condition holding a nested reference
 
@@ -407,6 +461,8 @@ every `$ref` string inside it is rewritten to its absolute form against the base
 /// rejects every instance. An absolute reference reaches the same document
 /// through `CacheSchemaResolver`, which reads the cache traversal has already
 /// populated.
+///
+/// A nested `$id` re-bases the references beneath it, as it does in traversal.
 fn absolute_refs(schema: &Value, base: &Url) -> Value
 ```
 
@@ -414,11 +470,27 @@ The walk is over the condition's own JSON. It resolves nothing, fetches nothing 
 follows a reference, so it cannot cycle however cyclic the schema is. A `$ref` that fails to
 join is left as written, which returns that one reference to today's behavior.
 
-`condition_holds` keeps its `Option<bool>`: `None` still means undecidable, and a condition
-that fails to compile still returns it, which is the insurance against a document the cache
-does not hold. What goes away is the third source of `None`, the pre-emptive refusal.
-`a_condition_holding_a_nested_reference_takes_both_branches` is rewritten to assert that the
-condition now decides.
+`condition_holds` keeps its `Option<bool>` and decides with `validate` rather than
+`is_valid`. Compilation is not where a reference is resolved: `RefValidator::compile` only
+builds the URL, and resolution happens on first evaluation. So a condition naming a
+document the cache does not hold compiles cleanly and `is_valid` reports `false` — the
+silent `else` that `names_a_ref` existed to prevent, reintroduced through the back door.
+Probed on a condition seeded against a document that exists and one that does not:
+
+| Reference inside the condition | `is_valid` | `validate` |
+|---|---|---|
+| `…/schema.json#/definitions/docker` | `true` | no errors |
+| `…/missing.json#/definitions/docker` | `false` | `Resolver`: failed to resolve |
+| `…/schema.json#/definitions/nope` | `false` | `InvalidReference` |
+
+So the rule is: an error of kind `Resolver` or `InvalidReference` among the validation
+errors means the condition could not be resolved and returns `None`; no errors means it
+holds; anything else means it does not. That is the insurance, and it is stronger than the
+refusal it replaces, because it distinguishes "false" from "unanswerable" where
+`names_a_ref` could only guess from the shape.
+
+`a_condition_holding_a_nested_reference_takes_both_branches` is rewritten to assert that
+the condition now decides.
 
 ### Bounding work, not just depth
 
@@ -429,18 +501,30 @@ condition now decides.
 > in-place descent passes the set on; every descent that consumes a path segment starts an
 > empty one, exactly where `MAX_COMPOSITION_DEPTH` already resets.
 
-The set is passed by value down each branch, so two `anyOf` members each get their own copy
-and neither hides a reference from the other. It is a `Vec<Url>` rather than a hash set: the
-chains it bounds are at most `MAX_COMPOSITION_DEPTH` long, and a linear scan of thirty-two
-URLs is cheaper than hashing them.
+It is a `Vec<Url>` passed by mutable reference: a `$ref` pushes its URL before descending
+into the target and pops it after, so sibling branches never see each other's entries and
+nothing is cloned. Branches run sequentially — every composition loop `await`s one member
+before starting the next — so push-and-pop gives exactly the per-chain semantics the rule
+describes. A `Vec` rather than a hash set, because the chains it bounds are at most
+`MAX_COMPOSITION_DEPTH` long and a linear scan of thirty-two URLs is cheaper than hashing
+them.
 
-This turns the branching cycle from exponential into linear, and leaves
-`MAX_COMPOSITION_DEPTH` as the backstop rather than the mechanism: a cycle stops at its second
-visit, and the budget is left to bound composition chains that make progress through distinct
-references.
+The composed-`allOf` branch in `collect_child_schemas` consults the same set, and a member
+whose URL is already in it is left out of the merge. It has to: that branch resolves its
+members through `ref_schema_value` and merges them rather than recursing on `$ref`, so no
+early return ever consults anything, and `json_value_merge` concatenates arrays, which
+doubles the merged `allOf` on every round. Probed through `possible_schemas_from` at the
+root, on `node = {"allOf": [{"$ref": m0}, …]}` where each member points back at `node`:
 
-The set is keyed on the resolved URL, so it is exactly as good as the resolution that produces
-it, which is why it lands after the base work rather than before.
+| Fan-out | Time |
+|---|---|
+| one | 853 µs |
+| two | 1.44 s |
+| three | did not finish in 400 s |
+
+This turns both cycles from exponential into linear, and leaves `MAX_COMPOSITION_DEPTH` as
+the backstop rather than the mechanism: a cycle stops at its second visit, and the budget is
+left to bound composition chains that make progress through distinct references.
 
 ### What `$defs` needs
 
@@ -457,7 +541,8 @@ it.
 becomes a resolved schema, which is the point. A user whose completion was empty gets
 completion; a user whose document had no diagnostics at all, because `validate` errored on a
 relative reference, gets diagnostics — including ones they have never seen for a document they
-believed was clean.
+believed was clean. Today's failure is silent in both directions: `validate` errors, the
+diagnostics handler logs `schema validation failed`, and the editor shows a clean document.
 
 **Hover text gains sibling annotations.** A key written as `{"$ref": ..., "description": ...}`
 shows the sibling's description where it showed the target's. That changes text for every
@@ -472,6 +557,18 @@ narrowing it is what the tracking issue asks for.
 before.** A relative reference under an `https` base is an HTTP request on a code path that
 previously errored out. The concurrency semaphore, the cache and the expiry are unchanged, so
 this is more of what already happens rather than a new kind of it.
+
+**`additionalProperties: false` beside a `$ref` still offers the target's keys.** Under
+2019-09 the validator applies both and rejects every key, because the carrier evaluates none
+of its own. Traversal offers what the target describes. This is the shape of the "offering a
+key that does not validate" trade named above, and it is the shape people actually write, so
+it is named rather than left to the general argument.
+
+**The same reference reached twice on one chain with different siblings loses the second
+carrier's keywords.** The visited set is keyed on the resolved URL. For a bare `$ref` that is
+lossless — same schema, same instance, same path, so the second visit would push a duplicate
+`unique_by` drops anyway. With siblings it is not, and no realistic schema writes it, so the
+set stays keyed on the URL rather than on the carrier.
 
 **A reference cycle is followed once rather than sixteen times.** A schema that reaches a
 position only by going around a cycle twice — through the same `$ref` URL twice with no
@@ -505,6 +602,17 @@ It should be its own feature set, and since this is the last one in the stack, i
 line on the tracking issue: *`collect_schemas` discards an `allOf` carrier's own annotations;
 give it the composed-`allOf` merge `collect_child_schemas` has, after settling what that merge
 does to arrays.*
+
+**A `$ref` to an embedded resource.** A subschema whose `$id` gives it its own URL inside a
+larger document, referenced by that URL, resolves in validation through `jsonschema`'s index
+and will not resolve in traversal: `resolve_schema` drops the fragment, joins to the URL, and
+fetches a document that does not exist on disk. Probed on `{"$id": "nested.json"}` inside the
+root, referenced as `{"$ref": "nested.json"}` — validation reports the expected type error,
+traversal errors today and will attempt a fetch afterwards. `anchored_subschema` is almost the
+walk that would find it, matched on the fragment-less URL instead of the fragment, so closing
+it means consulting the current document before `load_schema` for every fragment-less join.
+That is a change to what "load a schema" means rather than to what a reference resolves to,
+and it belongs with the fetch layer. It is a line for the tracking issue.
 
 **A document whose root `$id` disagrees with the URL it was fetched from.** The specification
 says the `$id` wins for everything inside it. Traversal will use it, through rule 1; validation
@@ -560,7 +668,10 @@ async fn world_with_documents(
 11. `{"$ref": ..., "enum": ["a"]}` over a target whose `enum` is `["b", "c"]` yields `["a"]`
     and not `["a", "b", "c"]`.
 12. `{"$ref": ..., "properties": {"extra": ...}}` yields a schema at `extra` and at every key
-    the target's own `properties` names.
+    the target's own `properties` names, and a sibling `$ref` written inside that `properties`
+    resolves against the document the sibling was written in.
+12b. A root written as `{"$ref": "#/$defs/model", "$defs": {...}}` — `$defs` beside a `$ref`,
+    which is not an applicable sibling — resolves exactly as it does today, on the fast path.
 13. `{"$ref": ..., "unevaluatedProperties": {...}}` over a target that does not evaluate a key
     yields the `unevaluatedProperties` schema for it, closing the divergence the applicator
     spec recorded.
@@ -571,18 +682,23 @@ async fn world_with_documents(
 16. A condition holding a nested `$ref` decides its branch: `{"kind": "docker"}` selects
     `then` and `{"kind": "podman"}` selects `else`, where both branches are returned today.
     `a_condition_holding_a_nested_reference_takes_both_branches` is rewritten to assert it.
-17. A condition whose nested `$ref` cannot be resolved still returns both branches.
+17. A condition whose nested `$ref` names a document the cache does not hold
+    (`file:///taplo-test/missing.json#/x`) returns both branches, and so does one naming a
+    pointer that does not exist. Asserted through `schemas_at_path`, so that deciding by
+    `is_valid` — which reports plain `false` for both — cannot make it pass.
 18. `validate` reports the expected diagnostic for a schema with a relative reference and no
-    `$id`, where it errors today, and for a schema whose root `$id` is relative, where
-    compilation fails today.
+    `$id`, where it errors today; for a schema whose root `$id` is relative, where compilation
+    fails today; and for a draft-4 root with a relative reference and no `id`.
 19. Traversal and validation agree on every shape in the end-to-end table: each resolves,
     asserted in one test that runs both against the same seeded documents.
 20. `schemas_at_path` over an `anyOf` of three references back to itself finishes in under a
     second, against 63 s today, and the two-reference case in under 100 ms, against 531 ms.
+    `possible_schemas_from` over a composed `allOf` of two references back to itself finishes
+    in under 100 ms, against 1.44 s today.
 21. Every schema `schemas_at_path` and `possible_schemas_from` returned before this feature set
-    is still returned: the 39 tests in
-    `cargo test -p taplo-common --features schema,reqwest,rustls-tls` and the 57 in
-    `cargo test -p taplo-lsp --lib handlers::hover` pass.
+    is still returned: every test in
+    `cargo test -p taplo-common --features schema,reqwest,rustls-tls` and in
+    `cargo test -p taplo-lsp --lib handlers::hover` passes, none removed and none weakened.
 22. `cargo check --workspace --all-targets`, `cargo test --workspace` and
     `cargo check --target wasm32-unknown-unknown --manifest-path crates/taplo-wasm/Cargo.toml`
     are clean.
@@ -593,25 +709,29 @@ Seven commits on `feat/schema-ref-resolution`, each building and passing on its 
 the last branch in a stack of five, so these are commits rather than separate pull requests;
 the branch opens one pull request.
 
-1. `fix(schema): resolve a ref as a uri reference` — `reference_url` deleted in favor of
+1. `perf(schema): stop revisiting a ref in one chain` — the visited set, in both traversals
+   and in the composed-`allOf` merge. First, because it is the only change here that fixes a
+   hang that exists today, and because every commit after it adds tests over cyclic fixtures.
+   It stores whatever URL the resolver produces, so the swap in commit 2 costs it nothing.
+   Criterion 20.
+2. `fix(schema): resolve a ref as a uri reference` — `reference_url` deleted in favor of
    `Url::join`, `resolve_schema`'s fragment read as written and percent-decoded, and the
    `$defs` confirmation tests. Fixes relative references at one hop, absolute references
    carrying a pointer, and `$ref: "#"`. Criteria 1 through 5, and 9.
-2. `feat(schema): carry a base url through traversal` — `root_url` becomes `base_url`, moved by
-   `$id` and by each resolved target. Criteria 6 and 7.
-3. `feat(schema): resolve a plain-name anchor` — `anchored_subschema`. Criterion 8.
-4. `feat(schema): apply keywords written beside a ref` — `merged_over`, and the sibling path in
-   both traversals. Criteria 10 through 15.
-5. `feat(schema): decide a condition holding a ref` — `absolute_refs`, `names_a_ref` removed.
-   Criteria 16 and 17.
-6. `fix(schema): validate against the schema's own url` — the `$id` absolutization in
+3. `feat(schema): carry a base url through traversal` — `root_url` becomes `base_url`, moved
+   by `$id` and by each resolved target. Criteria 6 and 7.
+4. `feat(schema): resolve a plain-name anchor` — `anchored_subschema`. Criterion 8.
+5. `feat(schema): apply keywords written beside a ref` — `merged_over`, `absolute_refs`, and
+   the sibling path in both traversals. Criteria 10 through 15.
+6. `feat(schema): decide a condition holding a ref` — `absolute_refs` reused, `names_a_ref`
+   removed, the condition decided through `validate`. Criteria 16 and 17.
+7. `fix(schema): validate against the schema's own url` — the `$id`/`id` absolutization in
    `add_validator`, and the agreement test. Criteria 18 and 19.
-7. `perf(schema): stop revisiting a ref in one chain` — the visited set. Criterion 20.
 
 The split is by mechanism, and each is a thing a reviewer could reject without rejecting its
-neighbors. Commit 1 is the one everything else needs, because a base is only useful once the
-join it feeds is right. Commits 5 and 7 depend on resolution being correct and on nothing else;
-commit 6 touches only the validator.
+neighbors. `absolute_refs` lands in commit 5 rather than in a commit of its own, because that
+is the first commit with a caller for it; commit 6 is its second. Commit 7 touches only the
+validator.
 
 ## Reproducing the findings
 
@@ -634,40 +754,44 @@ The `jsonschema` claims — the `pub(crate)` resolver, the compile scope, the si
 `~/.cargo/registry/src/*/jsonschema-0.17.1/src/`, and each was then confirmed by a probe through
 `validate`.
 
-Every probe was reverted; the baseline at `dc31977` is unchanged and green:
+Every probe was reverted; the baseline at `dc31977` — the tree this branch starts from, and
+the tree at `9766900` minus this document — is unchanged and green:
 `cargo check --workspace --all-targets`, `cargo test --workspace`,
 `cargo test -p taplo-common --features schema,reqwest,rustls-tls` (39 tests),
 `cargo test -p taplo-lsp --lib handlers::hover` (57 tests) and the wasm check all pass.
 
-Verified against `jsonschema` 0.17.1 at Taplo commit `dc31977`.
+Verified against `jsonschema` 0.17.1 at Taplo commit `9766900`.
 
-## Open questions
+## Questions settled
 
-1. **Should the visited set land first rather than last?** It is the only change here that
-   fixes a hang, and the hang exists today. Landing it first means writing it against
-   `reference_url`'s resolution and revising it in commit 2. Landing it last means the branch
-   carries a known 63-second hang through six commits. Which ordering is right?
+Each was open when this spec was first written, and each was answered by probing rather
+than by argument. The answers are folded into the sections above; what follows is the
+decision and the reason, so that a reader who disagrees knows what to reopen.
 
-2. **Is absolutizing a condition's references the right amount of ambition?** It removes
-   `names_a_ref`, which the applicator feature set called deliberately undecidable, and it was
-   probed working. But it makes condition evaluation depend on the cache holding the document,
-   which is true when traversal loaded it and may not be on some path not yet found. Is the
-   fallback to `None` on a failed compile sufficient insurance, or should the feature set keep
-   `names_a_ref` and leave this to a later one?
+1. **The visited set lands first, not last.** It stores whatever URL the resolver hands it,
+   and a cycle through `#/definitions/...` is a cycle under the resolution that exists today,
+   so nothing about it is revised when the join changes. Landing it last would carry a
+   63-second hang through six commits and run every later commit's cyclic fixtures against an
+   unbounded traversal.
 
-3. **Should traversal honor `$ref` siblings under draft 7, where the validator ignores them?**
-   The spec argues yes for annotations. The same rule also unions a sibling `properties` into
-   the target's, which a draft-7 validator would not do. Is offering a key that will not
-   validate acceptable here, or should the sibling merge be limited to the keywords that render
-   — `description`, `title`, `markdownDescription`, `deprecated`, `readOnly`, `writeOnly`,
-   `examples`, `default` — leaving applicator siblings to the drafts that define them?
+2. **A condition's references are absolutized, and `names_a_ref` is removed.** The insurance
+   is not a failed compile — a reference resolves lazily, so a missing document compiles
+   cleanly and reports plain `false`. The insurance is `validate` rather than `is_valid`,
+   reading `Resolver` and `InvalidReference` as "unanswerable".
 
-4. **Should `add_validator`'s `$id` absolutization be in this feature set at all?** It is the
-   smallest change here and the largest behavior change: a document that gets no diagnostics
-   today starts getting them. Is that a fix or a surprise, and does it belong behind the same
-   pull request as the traversal work?
+3. **Traversal honors `$ref` siblings under every draft.** The precedent is settled — it reads
+   `prefixItems` beside tuple `items` without a draft — and the VS Code JSON language service
+   does the same, so a schema author sees the same keys in both editors. Limiting the merge to
+   the rendering keywords would drop criteria 12 and 13, and 13 is what closes the divergence
+   the applicator spec recorded.
 
-5. **Is `anchored_subschema` worth its weight?** Plain-name anchors are rare in the schemas
-   taplo actually sees, and the checklist item says `$id` re-scoping rather than anchors.
-   Dropping it would leave `#port` erroring while validation resolves it. Keep, or defer with
-   the divergence written down?
+4. **`add_validator`'s absolutization stays in this feature set.** Without it, agreement
+   between the two halves is unreachable and the tracking issue's framing stays true. It is
+   not a surprise: today the failure is a `validate` error that the diagnostics handler logs
+   and the editor renders as a clean document, so the change is from silently wrong to
+   correct.
+
+5. **`anchored_subschema` stays.** Dropping it would not leave anchors unsupported; it would
+   leave them erroring, which costs every path beneath such a reference its hover and its
+   completion. What it does *not* cover — a `$ref` to an embedded resource — is written down
+   under "Deferred" instead.
