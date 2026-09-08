@@ -368,3 +368,32 @@ fn declared_draft_classifies_every_meta_schema_uri() {
         DeclaredDraft::Unrecognized
     );
 }
+
+#[tokio::test]
+async fn self_referential_all_of_terminates_at_a_non_empty_path() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "node": { "$ref": "#/definitions/node" }
+        },
+        "definitions": {
+            "node": {
+                "description": "Points back at itself.",
+                "allOf": [{ "$ref": "#/definitions/node" }]
+            }
+        }
+    }))
+    .await;
+
+    let keys = "node".parse::<Keys>().unwrap();
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert!(
+        found.is_empty(),
+        "an allOf carrier is not collected, and its only member points back at it"
+    );
+}

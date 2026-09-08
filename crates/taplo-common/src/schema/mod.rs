@@ -47,9 +47,11 @@ pub mod builtins {
     }
 }
 
-/// `$ref`, `allOf`, `oneOf` and `anyOf` can point back at the schema that
-/// contains them. Such a cycle makes no progress against the traversal depth,
-/// which only counts property nesting, so composition gets its own budget.
+/// `$ref`, `allOf`, `oneOf`, `anyOf` and the conditional applicators can point
+/// back at the schema that contains them. Such a cycle makes no progress
+/// against the traversal depth, which only counts property nesting, so
+/// composition gets its own budget. Both traversals spend it, and both reset
+/// it wherever a descent consumes a path segment.
 const MAX_COMPOSITION_DEPTH: usize = 32;
 
 #[derive(Clone)]
@@ -343,6 +345,7 @@ impl<E: Environment> Schemas<E> {
             value,
             Keys::empty(),
             path,
+            MAX_COMPOSITION_DEPTH,
             &mut schemas,
         )
         .await?;
@@ -358,6 +361,7 @@ impl<E: Environment> Schemas<E> {
     #[tracing::instrument(skip_all, fields(%path))]
     #[async_recursion(?Send)]
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     async fn collect_schemas(
         &self,
         root_url: &Url,
@@ -365,39 +369,74 @@ impl<E: Environment> Schemas<E> {
         value: &Value,
         full_path: Keys,
         path: &Keys,
+        composition_depth: usize,
         schemas: &mut Vec<(Keys, Arc<Value>)>,
     ) -> Result<(), anyhow::Error> {
-        if !schema.is_object() {
+        if !schema.is_object() || composition_depth == 0 {
             return Ok(());
         }
+
+        let composition_depth = composition_depth - 1;
 
         if let Some(r) = schema.schema_ref() {
             let url = reference_url(root_url, r)
                 .ok_or_else(|| anyhow!("could not determine schema URL"))?;
             let schema = self.resolve_schema(url).await?;
             return self
-                .collect_schemas(root_url, &schema, value, full_path.clone(), path, schemas)
+                .collect_schemas(
+                    root_url,
+                    &schema,
+                    value,
+                    full_path.clone(),
+                    path,
+                    composition_depth,
+                    schemas,
+                )
                 .await;
         }
 
         if let Some(one_ofs) = schema["oneOf"].as_array() {
             for one_of in one_ofs {
-                self.collect_schemas(root_url, one_of, value, full_path.clone(), path, schemas)
-                    .await?;
+                self.collect_schemas(
+                    root_url,
+                    one_of,
+                    value,
+                    full_path.clone(),
+                    path,
+                    composition_depth,
+                    schemas,
+                )
+                .await?;
             }
         }
 
         if let Some(any_ofs) = schema["anyOf"].as_array() {
             for any_of in any_ofs {
-                self.collect_schemas(root_url, any_of, value, full_path.clone(), path, schemas)
-                    .await?;
+                self.collect_schemas(
+                    root_url,
+                    any_of,
+                    value,
+                    full_path.clone(),
+                    path,
+                    composition_depth,
+                    schemas,
+                )
+                .await?;
             }
         }
 
         if let Some(all_ofs) = schema["allOf"].as_array() {
             for all_of in all_ofs {
-                self.collect_schemas(root_url, all_of, value, full_path.clone(), path, schemas)
-                    .await?;
+                self.collect_schemas(
+                    root_url,
+                    all_of,
+                    value,
+                    full_path.clone(),
+                    path,
+                    composition_depth,
+                    schemas,
+                )
+                .await?;
             }
         }
 
@@ -421,6 +460,7 @@ impl<E: Environment> Schemas<E> {
                     value,
                     full_path.join(k.clone()),
                     &child_path,
+                    MAX_COMPOSITION_DEPTH,
                     schemas,
                 )
                 .await?;
@@ -431,6 +471,7 @@ impl<E: Environment> Schemas<E> {
                     &value[k.value()],
                     full_path.join(k.clone()),
                     &child_path,
+                    MAX_COMPOSITION_DEPTH,
                     schemas,
                 )
                 .await?;
@@ -441,6 +482,7 @@ impl<E: Environment> Schemas<E> {
                     &value[k.value()],
                     full_path.join(k.clone()),
                     &child_path,
+                    MAX_COMPOSITION_DEPTH,
                     schemas,
                 )
                 .await?;
@@ -455,6 +497,7 @@ impl<E: Environment> Schemas<E> {
                                     &value[k.value()],
                                     full_path.join(k.clone()),
                                     &child_path,
+                                    MAX_COMPOSITION_DEPTH,
                                     schemas,
                                 )
                                 .await?;
@@ -484,6 +527,7 @@ impl<E: Environment> Schemas<E> {
                     &value[idx],
                     full_path.join(*idx),
                     &child_path,
+                    MAX_COMPOSITION_DEPTH,
                     schemas,
                 )
                 .await?;
