@@ -808,3 +808,66 @@ async fn a_boolean_unevaluated_properties_yields_nothing() {
 
     assert!(found.is_empty());
 }
+
+#[tokio::test]
+async fn a_negated_subschema_is_never_traversed() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "not": { "properties": { "banned": { "description": "banned" } } }
+    }))
+    .await;
+
+    let keys = "banned".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "banned": 1 }), &keys)
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+
+    let children = schemas
+        .possible_schemas_from(&url, &json!({}), &Keys::empty(), 5)
+        .await
+        .unwrap();
+    assert!(children
+        .iter()
+        .all(|(_, relative, _)| relative.to_string() != "banned"));
+}
+
+#[tokio::test]
+async fn property_names_is_never_the_schema_for_a_value() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "propertyNames": { "pattern": "^[a-z]+$", "description": "names" }
+    }))
+    .await;
+
+    let keys = "abc".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "abc": 1 }), &keys)
+        .await
+        .unwrap();
+
+    assert!(found.is_empty());
+}
+
+#[tokio::test]
+async fn contains_is_never_the_schema_for_an_index() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "list": {
+                "type": "array",
+                "contains": { "type": "string", "description": "contained" }
+            }
+        }
+    }))
+    .await;
+
+    let keys = "list".parse::<Keys>().unwrap().join(0_usize);
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "list": ["x"] }), &keys)
+        .await
+        .unwrap();
+
+    assert!(found.is_empty());
+}

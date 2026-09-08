@@ -260,6 +260,13 @@ struct Fact {
     values: Vec<String>,
 }
 
+/// A subschema a schema names in a role that is not "the value here": a
+/// prohibition, a rule for key names, a rule some element must satisfy.
+struct NestedFacts {
+    label: &'static str,
+    facts: Vec<Fact>,
+}
+
 /// One schema's hover text, assembled from independent contributors so that a
 /// keyword with nothing to say adds no separator.
 #[derive(Default)]
@@ -270,6 +277,9 @@ struct HoverSections {
     docs: Option<String>,
     /// One line per keyword that carries a concrete value or constraint.
     facts: Vec<Fact>,
+    /// One labelled block per subschema whose role is not "the value here",
+    /// rendered beneath the flat facts.
+    nested: Vec<NestedFacts>,
 }
 
 impl HoverSections {
@@ -278,27 +288,33 @@ impl HoverSections {
 
         blocks.extend(self.docs.clone());
 
-        if !self.facts.is_empty() {
-            blocks.push(
-                self.facts
-                    .iter()
-                    .map(|fact| {
-                        if fact.values.is_empty() {
-                            format!("- {}", fact.label)
-                        } else {
-                            format!(
-                                "- {}: {}",
-                                fact.label,
-                                fact.values.iter().map(|v| code_span(v)).join(", ")
-                            )
-                        }
-                    })
-                    .join("\n"),
-            );
+        if !self.facts.is_empty() || !self.nested.is_empty() {
+            let mut lines: Vec<String> =
+                self.facts.iter().map(|fact| fact_line(fact, "")).collect();
+
+            for nested in &self.nested {
+                lines.push(format!("- {}", nested.label));
+                lines.extend(nested.facts.iter().map(|fact| fact_line(fact, "  ")));
+            }
+
+            blocks.push(lines.join("\n"));
         }
 
         blocks.retain(|block| !block.is_empty());
         blocks.join("\n\n")
+    }
+}
+
+/// One bullet for a fact, indented for a nested block.
+fn fact_line(fact: &Fact, indent: &str) -> String {
+    if fact.values.is_empty() {
+        format!("{indent}- {}", fact.label)
+    } else {
+        format!(
+            "{indent}- {}: {}",
+            fact.label,
+            fact.values.iter().map(|value| code_span(value)).join(", ")
+        )
     }
 }
 
@@ -582,6 +598,138 @@ fn constraint_facts(schema: &Value) -> Vec<Fact> {
     facts
 }
 
+/// Keywords a nested block can show: the ones `subschema_facts` renders, and
+/// annotations that constrain nothing.
+///
+/// An allowlist rather than a list of what to refuse, because the two go stale
+/// in opposite directions. `subschema_facts` is one level deep, and an
+/// incomplete requirement is merely incomplete where an incomplete prohibition
+/// is wrong: a `not` over `properties` and `required` together forbids one
+/// value of one key, and a block naming only the key would read as forbidding
+/// the key. A keyword nobody has heard of yet costs a missing block.
+const RENDERABLE_SUBSCHEMA_KEYWORDS: &[&str] = &[
+    "type",
+    "const",
+    "enum",
+    "required",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "contentMediaType",
+    "contentEncoding",
+    "minItems",
+    "maxItems",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "title",
+    "description",
+    "markdownDescription",
+    "$comment",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "$id",
+    "$schema",
+    "definitions",
+    "$defs",
+    "x-taplo",
+];
+
+/// The types a subschema admits.
+fn type_fact(schema: &Value) -> Option<Fact> {
+    let values: Vec<String> = match &schema["type"] {
+        Value::String(name) => vec![name.clone()],
+        Value::Array(names) => names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    (!values.is_empty()).then_some(Fact {
+        label: "Type",
+        values,
+    })
+}
+
+/// The single value a subschema admits.
+fn const_fact(schema: &Value) -> Option<Fact> {
+    let node: Node = serde_json::from_value(schema.get("const")?.clone()).ok()?;
+
+    Some(Fact {
+        label: "Const",
+        values: vec![node.to_toml(true, false)],
+    })
+}
+
+/// The values a subschema admits, as TOML literals.
+fn enum_fact(schema: &Value) -> Option<Fact> {
+    let values: Vec<String> = schema["enum"]
+        .as_array()?
+        .iter()
+        .filter_map(|value| serde_json::from_value::<Node>(value.clone()).ok())
+        .map(|node| node.to_toml(true, false))
+        .collect();
+
+    (!values.is_empty()).then_some(Fact {
+        label: "One of",
+        values,
+    })
+}
+
+/// The keys a subschema demands.
+fn required_fact(schema: &Value) -> Option<Fact> {
+    let values: Vec<String> = schema["required"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect();
+
+    (!values.is_empty()).then_some(Fact {
+        label: "Required",
+        values,
+    })
+}
+
+/// What a subschema states about itself, for a reader who has been told the
+/// role it plays, or nothing when the block would be incomplete.
+///
+/// `type`, `const`, `enum` and `required` appear here and not among a schema's
+/// own facts because a nested block has no other channel: at the top level the
+/// written value shows its type, and `enum` and `const` reach the reader
+/// through value completion and value hover.
+fn subschema_facts(schema: &Value) -> Option<Vec<Fact>> {
+    let keywords = schema.as_object()?;
+
+    if !keywords
+        .keys()
+        .all(|keyword| RENDERABLE_SUBSCHEMA_KEYWORDS.contains(&keyword.as_str()))
+    {
+        return None;
+    }
+
+    let mut facts = Vec::new();
+
+    facts.extend(type_fact(schema));
+    facts.extend(const_fact(schema));
+    facts.extend(enum_fact(schema));
+    facts.extend(required_fact(schema));
+    facts.extend(constraint_facts(schema));
+
+    (!facts.is_empty()).then_some(facts)
+}
+
 /// Collects everything hover shows for a key from one schema.
 fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
     let ext = schema_ext_of(schema).unwrap_or_default();
@@ -618,6 +766,16 @@ fn key_hover_sections(schema: &Value, links_in_hover: bool) -> HoverSections {
             label: "Write-only",
             values: Vec::new(),
         });
+    }
+
+    for (label, keyword) in [
+        ("Must not match", "not"),
+        ("Key names", "propertyNames"),
+        ("Contains", "contains"),
+    ] {
+        if let Some(facts) = subschema_facts(&schema[keyword]) {
+            sections.nested.push(NestedFacts { label, facts });
+        }
     }
 
     sections
@@ -886,6 +1044,7 @@ pub(crate) mod tests {
                 label: "Default",
                 values: vec!["1".into()],
             }],
+            nested: Vec::new(),
         };
 
         assert_eq!(
@@ -1574,5 +1733,96 @@ pub(crate) mod tests {
             .collect();
 
         assert_eq!(targets, ["https://example.com/image"]);
+    }
+
+    #[tokio::test]
+    async fn renders_a_prohibition_as_a_labelled_block() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tag": {
+                    "type": "string",
+                    "not": { "type": "string", "pattern": "^latest$" }
+                }
+            }
+        });
+
+        let hovered = hover_at(schema, "tag = \"v1\"\n", 1).await;
+
+        assert_eq!(
+            hovered.as_deref(),
+            Some("- Must not match\n  - Type: `string`\n  - Pattern: `^latest$`")
+        );
+    }
+
+    #[tokio::test]
+    async fn renders_key_names_and_contains_as_labelled_blocks() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "env": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "propertyNames": { "pattern": "^[A-Z_]+$" }
+                },
+                "tags": {
+                    "type": "array",
+                    "contains": { "const": "release" }
+                }
+            }
+        });
+
+        assert_eq!(
+            hover_at(schema.clone(), "env = {}\n", 1).await.as_deref(),
+            Some("- Properties: `>= 1`\n- Key names\n  - Pattern: `^[A-Z_]+$`")
+        );
+        assert_eq!(
+            hover_at(schema, "tags = []\n", 1).await.as_deref(),
+            Some("- Contains\n  - Const: `\"release\"`")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subschema_with_nothing_to_show_produces_no_block() {
+        let cases = [
+            json!({ "not": {} }),
+            json!({ "not": { "properties": { "a": { "const": 1 } }, "required": ["a"] } }),
+            json!({ "not": { "dependentRequired": { "a": ["b"] } , "required": ["a"] } }),
+        ];
+
+        for case in cases {
+            let mut property = case.clone();
+            property["type"] = json!("string");
+
+            let schema = json!({
+                "type": "object",
+                "properties": { "tag": property }
+            });
+
+            assert_eq!(
+                hover_at(schema, "tag = \"v1\"\n", 1).await,
+                None,
+                "case {case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prohibition_states_what_a_subschema_requires() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "not": { "enum": ["debug", "trace"] }
+                }
+            }
+        });
+
+        let hovered = hover_at(schema, "mode = \"fast\"\n", 1).await;
+
+        assert_eq!(
+            hovered.as_deref(),
+            Some("- Must not match\n  - One of: `\"debug\"`, `\"trace\"`")
+        );
     }
 }
