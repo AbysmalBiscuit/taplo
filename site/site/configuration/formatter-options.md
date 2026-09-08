@@ -18,8 +18,10 @@ In some environments (e.g., Visual Studio Code), one needs to reload the extensi
 |   array_auto_expand   |                   Automatically expand arrays to multiple lines when they exceed `column_width` characters.                    |      true      |
 |  array_auto_collapse  |                                     Automatically collapse arrays if they fit in one line.                                     |      true      |
 |    compact_arrays     |                                       Omit whitespace padding inside single-line arrays.                                       |      true      |
-| compact_inline_tables |                                         Omit whitespace padding inside inline tables.                                          |     false      |
-|  inline_table_expand  |                                       Expand values (e.g. arrays) inside inline tables.                                        |      true      |
+| compact_inline_tables |                                   Omit whitespace padding inside single-line inline tables.                                   |     false      |
+|  inline_table_expand  |       Expand inline tables and their values when they exceed `column_width`. Requires `array_auto_expand`.                    |      true      |
+| inline_table_auto_collapse |                      Collapse multiline inline tables if they fit in one line and contain no comments.                      |      true      |
+| inline_table_trailing_comma |                                    Put trailing commas for multiline inline tables.                                         |      true      |
 |    compact_entries    |                                                  Omit whitespace around `=`.                                                   |     false      |
 |     column_width      |                          Target maximum column width after which arrays are expanded into new lines.                           |       80       |
 |     indent_tables     |                                            Indent subtables if they come in order.                                             |     false      |
@@ -28,6 +30,15 @@ In some environments (e.g., Visual Studio Code), one needs to reload the extensi
 |   trailing_newline    |                                              Add trailing newline to the source.                                               |      true      |
 |     reorder_keys      |                               Alphabetically reorder keys that are not separated by blank lines.                               |     false      |
 |    reorder_arrays     |                           Alphabetically reorder array values that are not separated by blank lines.                           |     false      |
-| reorder_inline_tables |                                             Alphabetically reorder inline tables.                                              |     false      |
+| reorder_inline_tables |                       Alphabetically reorder inline table entries within groups separated by comments or blank lines.                       |     false      |
 |  allowed_blank_lines  |                                     The maximum amount of consecutive blank lines allowed.                                     |       2        |
 |         crlf          |                                                     Use CRLF line endings.                                                     |     false      |
+
+Multiline inline tables use TOML 1.1 syntax. To keep their multiline layout even when the entries fit on one line, set:
+
+```toml
+[formatting]
+inline_table_auto_collapse = false
+```
+
+Comments inside inline tables are preserved. Trailing comments move with their entries when `reorder_inline_tables` is enabled.

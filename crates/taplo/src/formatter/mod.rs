@@ -8,12 +8,10 @@ use crate::{
     syntax::{SyntaxElement, SyntaxKind::*, SyntaxNode, SyntaxToken},
     util::overlaps,
 };
-use itertools::Itertools;
 use once_cell::unsync::OnceCell;
 use rowan::{GreenNode, NodeOrToken, TextRange};
 use std::{
     cmp,
-    collections::VecDeque,
     iter::{repeat, FromIterator},
     ops::Range,
     rc::Rc,
@@ -66,9 +64,16 @@ create_options!(
         /// exceed the configured `column_width`.
         pub array_auto_expand: bool,
 
-        /// Expand values (e.g.) inside inline tables
-        /// where possible.
+        /// Expand inline tables and their values when they exceed
+        /// `column_width`. Requires `array_auto_expand`.
         pub inline_table_expand: bool,
+
+        /// Automatically collapse multiline inline tables if they fit
+        /// in one line and contain no comments.
+        pub inline_table_auto_collapse: bool,
+
+        /// Put trailing commas for multiline inline tables.
+        pub inline_table_trailing_comma: bool,
 
         /// Automatically collapse arrays if they
         /// fit in one line.
@@ -80,7 +85,7 @@ create_options!(
         /// Omit whitespace padding inside single-line arrays.
         pub compact_arrays: bool,
 
-        /// Omit whitespace padding inside inline tables.
+        /// Omit whitespace padding inside single-line inline tables.
         pub compact_inline_tables: bool,
 
         /// Omit whitespace around `=`.
@@ -166,6 +171,8 @@ impl Default for Options {
             indent_tables: false,
             indent_entries: false,
             inline_table_expand: true,
+            inline_table_auto_collapse: true,
+            inline_table_trailing_comma: true,
             trailing_newline: true,
             allowed_blank_lines: 2,
             indent_string: "  ".into(),
@@ -811,21 +818,8 @@ fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl 
     for c in node.children_with_tokens() {
         match c {
             NodeOrToken::Node(n) => match n.kind() {
-                ARRAY => {
-                    let formatted = format_array(n, &scoped_options, context);
-
-                    let c = formatted.trailing_comment();
-
-                    if let Some(c) = c {
-                        debug_assert!(comment.is_none());
-                        comment = Some(c)
-                    }
-
-                    debug_assert!(value.is_empty());
-                    formatted.write_to(&mut value, &scoped_options);
-                }
-                INLINE_TABLE => {
-                    let formatted = format_inline_table(n, &scoped_options, context);
+                ARRAY | INLINE_TABLE => {
+                    let formatted = format_collection(n, &scoped_options, context);
 
                     let c = formatted.trailing_comment();
 
@@ -856,110 +850,48 @@ fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl 
     (node.into(), value, comment)
 }
 
-fn format_inline_table(
-    node: SyntaxNode,
-    options: &Options,
-    context: &Context,
-) -> impl FormattedItem {
-    let mut formatted = String::new();
-    let mut comment = None;
-
-    let mut context = context.clone();
-    if context.force_multiline {
-        context.force_multiline = options.inline_table_expand;
-    }
-    let context = &context;
-
-    let child_count = node.children().count();
-
-    if node.children().count() == 0 {
-        formatted = "{}".into();
-    }
-
-    let mut sorted_children = if options.reorder_inline_tables {
-        Some(
-            node.children()
-                .sorted_unstable_by(|x, y| x.to_string().cmp(&y.to_string()))
-                .collect::<VecDeque<_>>(),
-        )
+fn format_collection(node: SyntaxNode, options: &Options, context: &Context) -> impl FormattedItem {
+    let inline_table = node.kind() == INLINE_TABLE;
+    let (opening, closing) = if inline_table { ('{', '}') } else { ('[', ']') };
+    let auto_collapse = if inline_table {
+        options.inline_table_auto_collapse
     } else {
-        None
+        options.array_auto_collapse
     };
+    let trailing_comma = if inline_table {
+        options.inline_table_trailing_comma
+    } else {
+        options.array_trailing_comma
+    };
+    let compact = if inline_table {
+        options.compact_inline_tables
+    } else {
+        options.compact_arrays
+    };
+    let reorder = if inline_table {
+        options.reorder_inline_tables
+    } else {
+        options.reorder_arrays
+    };
+    let mut context = context.clone();
+    context.force_multiline &= !inline_table || options.inline_table_expand;
+    let context = &context;
+    let has_comments = node.descendants_with_tokens().any(|n| n.kind() == COMMENT);
+    let has_newlines = if inline_table {
+        node.children_with_tokens().any(|n| n.kind() == NEWLINE)
+    } else {
+        node.descendants_with_tokens().any(|n| n.kind() == NEWLINE)
+    };
+    let mut multiline = has_newlines || has_comments || context.force_multiline;
 
-    let mut node_index = 0;
-    for c in node.children_with_tokens() {
-        match c {
-            NodeOrToken::Node(n) => {
-                if node_index != 0 {
-                    formatted += ", ";
-                }
-
-                let child = if options.reorder_inline_tables {
-                    sorted_children
-                        .as_mut()
-                        .and_then(|children| children.pop_front())
-                        .unwrap_or(n)
-                } else {
-                    n
-                };
-
-                let entry = format_entry(child, options, context);
-                debug_assert!(entry.comment.is_none());
-                entry.write_to(&mut formatted, options);
-
-                node_index += 1;
-            }
-            NodeOrToken::Token(t) => match t.kind() {
-                BRACE_START => {
-                    if child_count == 0 {
-                        // We're only interested in trailing comments.
-                        continue;
-                    }
-
-                    formatted += "{";
-                    if !options.compact_inline_tables {
-                        formatted += " ";
-                    }
-                }
-                BRACE_END => {
-                    if child_count == 0 {
-                        // We're only interested in trailing comments.
-                        continue;
-                    }
-
-                    if !options.compact_inline_tables {
-                        formatted += " ";
-                    }
-                    formatted += "}";
-                }
-                WHITESPACE | COMMA => {}
-                COMMENT => {
-                    debug_assert!(comment.is_none());
-                    comment = Some(t.text().into());
-                }
-                _ => formatted += t.text(),
-            },
-        }
+    if inline_table && node.children().next().is_none() && !has_comments {
+        return (node.into(), "{}".to_string(), None);
     }
-
-    (node.into(), formatted, comment)
-}
-// Check whether the array spans multiple lines in its current form.
-fn is_array_multiline(node: &SyntaxNode) -> bool {
-    node.descendants_with_tokens().any(|n| n.kind() == NEWLINE)
-}
-
-fn can_collapse_array(node: &SyntaxNode) -> bool {
-    !node.descendants_with_tokens().any(|n| n.kind() == COMMENT)
-}
-
-fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl FormattedItem {
-    let mut multiline = is_array_multiline(&node) || context.force_multiline;
 
     let mut formatted = String::new();
 
     // We always try to collapse it if possible.
-    if can_collapse_array(&node) && options.array_auto_collapse && !context.force_multiline {
+    if !has_comments && auto_collapse && !context.force_multiline {
         multiline = false;
     }
 
@@ -978,7 +910,7 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
      -> bool {
         let were_values = !value_group.is_empty();
 
-        if options.reorder_arrays {
+        if reorder {
             value_group.sort_unstable_by(|x, y| x.0.cmp(&y.0));
         }
 
@@ -1044,21 +976,26 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
     for c in node.children_with_tokens() {
         match c {
             NodeOrToken::Node(n) => match n.kind() {
-                VALUE => {
-                    if multiline && formatted.ends_with('[') {
+                VALUE | ENTRY => {
+                    if multiline && formatted.ends_with(opening) {
                         formatted += options.newline();
                     }
 
-                    let val = format_value(n, options, &inner_context);
                     let mut val_string = String::new();
+                    let comment = if inline_table {
+                        let entry = format_entry(n, options, &inner_context);
+                        entry.write_to(&mut val_string, options);
+                        entry.comment
+                    } else {
+                        let val = format_value(n, options, &inner_context);
+                        val.write_to(&mut val_string, options);
+                        val.trailing_comment()
+                    };
 
-                    val.write_to(&mut val_string, options);
-
-                    let has_comma =
-                        node_index < node_count - 1 || (multiline && options.array_trailing_comma);
+                    let has_comma = node_index < node_count - 1 || (multiline && trailing_comma);
                     commas_group.push(has_comma);
 
-                    value_group.push((val_string, val.trailing_comment()));
+                    value_group.push((val_string, comment));
                     skip_newlines += 1;
 
                     node_index += 1;
@@ -1070,13 +1007,13 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                 }
             },
             NodeOrToken::Token(t) => match t.kind() {
-                BRACKET_START => {
-                    formatted += "[";
-                    if !options.compact_arrays && !multiline {
+                BRACKET_START | BRACE_START => {
+                    formatted.push(opening);
+                    if !compact && !multiline {
                         formatted += " ";
                     }
                 }
-                BRACKET_END => {
+                BRACKET_END | BRACE_END => {
                     add_values(
                         &mut value_group,
                         &mut commas_group,
@@ -1090,10 +1027,10 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                         }
 
                         formatted.extend(context.indent(options));
-                    } else if !options.compact_arrays {
+                    } else if !compact {
                         formatted += " ";
                     }
-                    formatted += "]";
+                    formatted.push(closing);
                 }
                 NEWLINE => {
                     if !multiline {
@@ -1133,10 +1070,11 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                         .map(|s| s.kind() == NEWLINE)
                         .unwrap_or(false);
 
-                    if !newline_before && !value_group.is_empty() {
-                        // It's actually trailing comment, so we add it to the last value.
-                        value_group.last_mut().unwrap().1 = Some(t.text().to_string());
-                        continue;
+                    if !newline_before {
+                        if let Some((_, comment @ None)) = value_group.last_mut() {
+                            *comment = Some(t.text().to_string());
+                            continue;
+                        }
                     }
 
                     if add_values(
@@ -1149,7 +1087,7 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
                         skip_newlines = 0;
                     }
 
-                    if formatted.ends_with('[') {
+                    if formatted.ends_with(opening) {
                         formatted += " ";
                         formatted += t.text();
                     } else {
@@ -1163,7 +1101,8 @@ fn format_array(node: SyntaxNode, options: &Options, context: &Context) -> impl 
     }
 
     if formatted.is_empty() {
-        formatted = "[]".into();
+        formatted.push(opening);
+        formatted.push(closing);
     }
 
     (node.into(), formatted, None)

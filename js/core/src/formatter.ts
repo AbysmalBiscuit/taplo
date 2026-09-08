@@ -20,6 +20,20 @@ export interface FormatterOptions {
    */
   arrayAutoExpand?: boolean;
   /**
+   * Expand inline tables and their values when they exceed the maximum column width.
+   * Requires arrayAutoExpand.
+   */
+  inlineTableExpand?: boolean;
+  /**
+   * Collapse multiline inline tables that fit in one line and don't contain comments.
+   * Defaults to true.
+   */
+  inlineTableAutoCollapse?: boolean;
+  /**
+   * Append trailing commas for multiline inline tables. Defaults to true.
+   */
+  inlineTableTrailingComma?: boolean;
+  /**
    * Collapse arrays that don't exceed the maximum column width and don't contain comments.
    */
   arrayAutoCollapse?: boolean;
