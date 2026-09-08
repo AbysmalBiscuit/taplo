@@ -871,3 +871,120 @@ async fn contains_is_never_the_schema_for_an_index() {
 
     assert!(found.is_empty());
 }
+
+/// Runs an async traversal on its own thread and runtime and panics with
+/// `what` when it has not finished inside `bound`.
+///
+/// `tokio::time::timeout` cannot bound a traversal: it never reaches an await
+/// point that yields to the runtime, so the timeout future never gets to run.
+fn assert_finishes_within<T, F, Fut>(bound: std::time::Duration, what: &'static str, work: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        drop(tx.send(runtime.block_on(work())));
+    });
+
+    rx.recv_timeout(bound).unwrap_or_else(|_| panic!("{what}"))
+}
+
+/// The composed-`allOf` branch merges its members instead of recursing on
+/// `$ref`, so a cycle whose nodes are reachable only as members is invisible to
+/// a check that consults the visited set without ever feeding it.
+#[test]
+fn a_cycle_through_composed_all_of_members_terminates() {
+    assert_finishes_within(
+        std::time::Duration::from_secs(5),
+        "a cycle through merged allOf members did not terminate",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "type": "object",
+                "properties": { "a": { "$ref": "#/definitions/a" } },
+                "definitions": {
+                    "a": { "allOf": [{ "$ref": "#/definitions/b" }] },
+                    "b": { "allOf": [
+                        { "$ref": "#/definitions/c" },
+                        { "$ref": "#/definitions/d" },
+                        { "$ref": "#/definitions/e" }
+                    ] },
+                    "c": { "allOf": [{ "$ref": "#/definitions/b" }] },
+                    "d": { "allOf": [{ "$ref": "#/definitions/b" }] },
+                    "e": { "allOf": [{ "$ref": "#/definitions/b" }] }
+                }
+            }))
+            .await;
+
+            schemas
+                .possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5)
+                .await
+                .map(|found| found.len())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_composed_all_of_cycle_terminates() {
+    assert_finishes_within(
+        std::time::Duration::from_secs(5),
+        "a composed allOf cycle did not terminate",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "type": "object",
+                "properties": { "node": { "$ref": "#/definitions/node" } },
+                "definitions": {
+                    "node": { "allOf": [
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" }
+                    ] }
+                }
+            }))
+            .await;
+
+            schemas
+                .possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5)
+                .await
+                .map(|found| found.len())
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_three_way_any_of_cycle_terminates() {
+    assert_finishes_within(
+        std::time::Duration::from_secs(5),
+        "a three-way anyOf cycle did not terminate",
+        || async {
+            let (schemas, url) = seeded(json!({
+                "type": "object",
+                "properties": { "node": { "$ref": "#/definitions/node" } },
+                "definitions": {
+                    "node": { "anyOf": [
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" },
+                        { "$ref": "#/definitions/node" }
+                    ] }
+                }
+            }))
+            .await;
+
+            let keys = "node".parse::<Keys>().unwrap();
+
+            schemas
+                .schemas_at_path(&url, &Value::Null, &keys)
+                .await
+                .map(|found| found.len())
+        },
+    )
+    .unwrap();
+}

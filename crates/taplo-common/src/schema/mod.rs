@@ -347,6 +347,7 @@ impl<E: Environment> Schemas<E> {
                 Keys::empty(),
                 path,
                 MAX_COMPOSITION_DEPTH,
+                &mut Vec::new(),
                 &mut schemas,
             )
             .await?;
@@ -378,7 +379,7 @@ impl<E: Environment> Schemas<E> {
         }
 
         let resolved = self.ref_schema_value(root_url, condition).await;
-        let condition = resolved.as_deref().unwrap_or(condition);
+        let condition = resolved.as_ref().map_or(condition, |(_, schema)| &**schema);
 
         if names_a_ref(condition) {
             return None;
@@ -459,6 +460,7 @@ impl<E: Environment> Schemas<E> {
         full_path: Keys,
         path: &Keys,
         composition_depth: usize,
+        visited: &mut Vec<Url>,
         schemas: &mut Vec<(Keys, Arc<Value>)>,
     ) -> Result<bool, anyhow::Error> {
         if !schema.is_object() || composition_depth == 0 {
@@ -470,8 +472,18 @@ impl<E: Environment> Schemas<E> {
         if let Some(r) = schema.schema_ref() {
             let url = reference_url(root_url, r)
                 .ok_or_else(|| anyhow!("could not determine schema URL"))?;
-            let schema = self.resolve_schema(url).await?;
-            return self
+
+            // A reference already followed on this chain leads back to a schema
+            // whose contribution is already in the accumulator, so following it
+            // again only multiplies the work a cycle costs.
+            if visited.contains(&url) {
+                return Ok(false);
+            }
+
+            let schema = self.resolve_schema(url.clone()).await?;
+
+            visited.push(url);
+            let evaluated = self
                 .collect_schemas(
                     root_url,
                     &schema,
@@ -479,9 +491,13 @@ impl<E: Environment> Schemas<E> {
                     full_path.clone(),
                     path,
                     composition_depth,
+                    visited,
                     schemas,
                 )
                 .await;
+            visited.pop();
+
+            return evaluated;
         }
 
         let mut evaluated = false;
@@ -496,6 +512,7 @@ impl<E: Environment> Schemas<E> {
                         full_path.clone(),
                         path,
                         composition_depth,
+                        visited,
                         schemas,
                     )
                     .await?;
@@ -512,6 +529,7 @@ impl<E: Environment> Schemas<E> {
                         full_path.clone(),
                         path,
                         composition_depth,
+                        visited,
                         schemas,
                     )
                     .await?;
@@ -528,6 +546,7 @@ impl<E: Environment> Schemas<E> {
                         full_path.clone(),
                         path,
                         composition_depth,
+                        visited,
                         schemas,
                     )
                     .await?;
@@ -543,6 +562,7 @@ impl<E: Environment> Schemas<E> {
                     full_path.clone(),
                     path,
                     composition_depth,
+                    visited,
                     schemas,
                 )
                 .await?;
@@ -570,6 +590,7 @@ impl<E: Environment> Schemas<E> {
                         full_path.join(k.clone()),
                         &child_path,
                         MAX_COMPOSITION_DEPTH,
+                        &mut Vec::new(),
                         schemas,
                     )
                     .await?;
@@ -582,6 +603,7 @@ impl<E: Environment> Schemas<E> {
                         full_path.join(k.clone()),
                         &child_path,
                         MAX_COMPOSITION_DEPTH,
+                        &mut Vec::new(),
                         schemas,
                     )
                     .await?;
@@ -595,6 +617,7 @@ impl<E: Environment> Schemas<E> {
                         full_path.join(k.clone()),
                         &child_path,
                         MAX_COMPOSITION_DEPTH,
+                        &mut Vec::new(),
                         schemas,
                     )
                     .await?;
@@ -612,6 +635,7 @@ impl<E: Environment> Schemas<E> {
                                         full_path.join(k.clone()),
                                         &child_path,
                                         MAX_COMPOSITION_DEPTH,
+                                        &mut Vec::new(),
                                         schemas,
                                     )
                                     .await?;
@@ -633,6 +657,7 @@ impl<E: Environment> Schemas<E> {
                             full_path.join(k.clone()),
                             &child_path,
                             MAX_COMPOSITION_DEPTH,
+                            &mut Vec::new(),
                             schemas,
                         )
                         .await?;
@@ -661,6 +686,7 @@ impl<E: Environment> Schemas<E> {
                         full_path.join(*idx),
                         &child_path,
                         MAX_COMPOSITION_DEPTH,
+                        &mut Vec::new(),
                         schemas,
                     )
                     .await?;
@@ -691,6 +717,7 @@ impl<E: Environment> Schemas<E> {
                 instance_at(value, &path),
                 max_depth,
                 MAX_COMPOSITION_DEPTH,
+                &mut Vec::new(),
                 &mut children,
             )
             .await;
@@ -716,6 +743,7 @@ impl<E: Environment> Schemas<E> {
         instance: &Value,
         mut depth: usize,
         composition_depth: usize,
+        visited: &mut Vec<Url>,
         schemas: &mut Vec<(Keys, Keys, Arc<Value>)>,
     ) {
         if !schema.is_object() || depth == 0 || composition_depth == 0 {
@@ -724,19 +752,27 @@ impl<E: Environment> Schemas<E> {
 
         let composition_depth = composition_depth - 1;
 
-        if let Some(schema) = self.ref_schema_value(root_url, schema).await {
-            return self
-                .collect_child_schemas(
-                    root_url,
-                    &schema,
-                    root_path,
-                    path,
-                    instance,
-                    depth,
-                    composition_depth,
-                    schemas,
-                )
-                .await;
+        if let Some((url, resolved)) = self.ref_schema_value(root_url, schema).await {
+            if visited.contains(&url) {
+                return;
+            }
+
+            visited.push(url);
+            self.collect_child_schemas(
+                root_url,
+                &resolved,
+                root_path,
+                path,
+                instance,
+                depth,
+                composition_depth,
+                visited,
+                schemas,
+            )
+            .await;
+            visited.pop();
+
+            return;
         }
 
         if let Some(one_ofs) = schema["oneOf"].as_array() {
@@ -749,6 +785,7 @@ impl<E: Environment> Schemas<E> {
                     instance,
                     depth,
                     composition_depth,
+                    visited,
                     schemas,
                 )
                 .await;
@@ -765,6 +802,7 @@ impl<E: Environment> Schemas<E> {
                     instance,
                     depth,
                     composition_depth,
+                    visited,
                     schemas,
                 )
                 .await;
@@ -783,6 +821,7 @@ impl<E: Environment> Schemas<E> {
                 instance,
                 depth,
                 composition_depth,
+                visited,
                 schemas,
             )
             .await;
@@ -809,15 +848,25 @@ impl<E: Environment> Schemas<E> {
                 }
 
                 let mut merged_all_of = Value::Object(serde_json::Map::default());
+                let mut merged_urls = Vec::new();
 
                 for all_of in all_ofs {
-                    merged_all_of.merge(match self.ref_schema_value(root_url, all_of).await {
-                        Some(ref schema) => schema,
-                        None => all_of,
-                    });
+                    match self.ref_schema_value(root_url, all_of).await {
+                        Some((url, resolved)) => {
+                            if visited.contains(&url) || merged_urls.contains(&url) {
+                                continue;
+                            }
+                            merged_urls.push(url);
+                            merged_all_of.merge(&resolved);
+                        }
+                        None => merged_all_of.merge(all_of),
+                    }
                 }
 
                 merged_all_of.merge(&schema);
+
+                let merged_count = merged_urls.len();
+                visited.append(&mut merged_urls);
 
                 self.collect_child_schemas(
                     root_url,
@@ -827,9 +876,12 @@ impl<E: Environment> Schemas<E> {
                     instance,
                     depth,
                     composition_depth,
+                    visited,
                     schemas,
                 )
                 .await;
+
+                visited.truncate(visited.len() - merged_count);
             }
             // TODO: handle allOfs in regular schemas.
         }
@@ -856,6 +908,7 @@ impl<E: Environment> Schemas<E> {
                     &instance[k],
                     depth,
                     MAX_COMPOSITION_DEPTH,
+                    &mut Vec::new(),
                     schemas,
                 )
                 .await;
@@ -863,28 +916,27 @@ impl<E: Environment> Schemas<E> {
         }
     }
 
-    async fn ref_schema_value(&self, root_url: &Url, schema: &Value) -> Option<Arc<Value>> {
-        if let Some(r) = schema.schema_ref() {
-            let url = match reference_url(root_url, r)
-                .ok_or_else(|| anyhow!("could not determine schema URL"))
-            {
-                Ok(u) => u,
-                Err(error) => {
-                    tracing::error!(?error, "failed to resolve schema");
-                    return None;
-                }
-            };
-            let schema = match self.resolve_schema(url).await {
-                Ok(s) => s,
-                Err(error) => {
-                    tracing::error!(?error, "failed to resolve schema");
-                    return None;
-                }
-            };
+    /// The schema a `$ref` names, with the URL it resolved to.
+    ///
+    /// The URL is what the visited set is keyed on, so it has to travel with
+    /// the value rather than be recomputed by the caller.
+    async fn ref_schema_value(&self, root_url: &Url, schema: &Value) -> Option<(Url, Arc<Value>)> {
+        let r = schema.schema_ref()?;
 
-            Some(schema)
-        } else {
-            None
+        let url = match reference_url(root_url, r) {
+            Some(u) => u,
+            None => {
+                tracing::error!(reference = r, "could not determine schema URL");
+                return None;
+            }
+        };
+
+        match self.resolve_schema(url.clone()).await {
+            Ok(s) => Some((url, s)),
+            Err(error) => {
+                tracing::error!(?error, "failed to resolve schema");
+                None
+            }
         }
     }
 }
