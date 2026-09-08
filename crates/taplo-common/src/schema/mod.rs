@@ -393,11 +393,12 @@ impl<E: Environment> Schemas<E> {
     }
 
     /// The subschemas that apply to the same instance as `schema` itself and
-    /// consume no path: the `if` branch the instance selects.
+    /// consume no path: the `if` branch the instance selects, and the schemas
+    /// its present keys depend on.
     ///
-    /// An absent instance, or a condition that cannot be decided, yields both
-    /// branches, which is what traversal already offers for `oneOf` and
-    /// `anyOf`.
+    /// An absent instance, or a condition that cannot be decided, yields every
+    /// branch and every dependent schema, which is what traversal already
+    /// offers for `oneOf` and `anyOf`.
     async fn conditional_subschemas<'s>(
         &self,
         root_url: &Url,
@@ -419,6 +420,27 @@ impl<E: Environment> Schemas<E> {
             };
 
             applicable.extend(selected.iter().copied().filter(|b| !b.is_null()));
+        }
+
+        // `dependentSchemas` is the 2019-09 spelling of `dependencies`' schema
+        // form. Traversal reads whichever a schema happens to carry, the way
+        // it reads `prefixItems` and tuple `items` side by side. The array
+        // form of either names keys rather than a schema, and is skipped by
+        // the object check.
+        for keyword in ["dependencies", "dependentSchemas"] {
+            let Some(dependents) = schema[keyword].as_object() else {
+                continue;
+            };
+
+            for (trigger, dependent) in dependents {
+                if !dependent.is_object() {
+                    continue;
+                }
+
+                if instance.is_null() || instance.get(trigger).is_some() {
+                    applicable.push(dependent);
+                }
+            }
         }
 
         applicable

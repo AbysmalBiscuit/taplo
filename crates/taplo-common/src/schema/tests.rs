@@ -611,3 +611,83 @@ async fn completion_follows_the_branch_the_document_selects() {
 
     assert_eq!(offered, ["image"]);
 }
+
+/// One dependent schema under whichever keyword spells it, so that both
+/// spellings are asserted against the same shape.
+fn dependent_schema(keyword: &str) -> Value {
+    json!({
+        "type": "object",
+        keyword: {
+            "kind": { "properties": { "image": { "description": "dependent" } } }
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_present_trigger_key_applies_its_dependent_schema() {
+    for keyword in ["dependencies", "dependentSchemas"] {
+        let (schemas, url) = seeded(dependent_schema(keyword)).await;
+
+        let keys = "image".parse::<Keys>().unwrap();
+        let found = schemas
+            .schemas_at_path(&url, &json!({ "kind": "docker" }), &keys)
+            .await
+            .unwrap();
+
+        assert_eq!(descriptions(&found), ["dependent"], "keyword {keyword}");
+    }
+}
+
+#[tokio::test]
+async fn an_absent_trigger_key_applies_nothing() {
+    for keyword in ["dependencies", "dependentSchemas"] {
+        let (schemas, url) = seeded(dependent_schema(keyword)).await;
+
+        let keys = "image".parse::<Keys>().unwrap();
+        let found = schemas
+            .schemas_at_path(&url, &json!({ "other": 1 }), &keys)
+            .await
+            .unwrap();
+
+        assert!(found.is_empty(), "keyword {keyword}");
+    }
+}
+
+#[tokio::test]
+async fn an_absent_instance_applies_every_dependent_schema() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "dependentSchemas": {
+            "a": { "properties": { "image": { "description": "from a" } } },
+            "b": { "properties": { "image": { "description": "from b" } } }
+        }
+    }))
+    .await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["from a", "from b"]);
+}
+
+#[tokio::test]
+async fn the_array_form_of_dependencies_applies_nothing() {
+    for keyword in ["dependencies", "dependentRequired"] {
+        let (schemas, url) = seeded(json!({
+            "type": "object",
+            keyword: { "kind": ["image"] }
+        }))
+        .await;
+
+        let keys = "image".parse::<Keys>().unwrap();
+        let found = schemas
+            .schemas_at_path(&url, &json!({ "kind": "docker" }), &keys)
+            .await
+            .unwrap();
+
+        assert!(found.is_empty(), "keyword {keyword}");
+    }
+}
