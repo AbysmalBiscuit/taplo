@@ -19,7 +19,7 @@
 - `rg` not `grep`, `fd` not `find`. `rg -r` means `--replace`, so line numbers are `rg -n`.
 - `cargo fmt --check` is not clean at the branch point. Format only the files you touch: `cargo fmt -p taplo-common` / `-p taplo-lsp` is too broad — run `rustfmt --edition 2021 <file>` on the exact files changed, or check the diff by hand.
 - Two `dead_code` warnings in `taplo` and `lsp-async-stub` are inherited and expected.
-- `taplo-common`'s schema tests only build with features: `cargo test -p taplo-common --features schema,reqwest,rustls-tls`.
+- Run `taplo-common`'s schema tests with `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`. `cargo test --workspace` reaches them too through feature unification, and stops at the first failing crate, so a failure there hides later crates' results.
 - The spec's commit 2 lands here as two commits (Tasks 2 and 3), because the traversal change and the handler change are independently rejectable.
 
 ---
@@ -64,15 +64,20 @@ async fn self_referential_all_of_terminates_at_a_non_empty_path() {
         .await
         .unwrap();
 
-    assert_eq!(descriptions(&found), ["Points back at itself."]);
+    assert!(
+        found.is_empty(),
+        "an allOf carrier is not collected, and its only member points back at it"
+    );
 }
 ```
 
+The assertion is about termination, not content: `include_self = schema["allOf"].is_null()` discards a carrier that writes `allOf`, and this one's only member is the reference back to itself, so nothing is left to collect. What the test proves is that the traversal returns at all.
+
 - [ ] **Step 2: Run the test and watch it fail**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls self_referential_all_of_terminates_at_a_non_empty_path`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls self_referential_all_of_terminates_at_a_non_empty_path`
 
-Expected: the process aborts with `has overflowed its stack` / `fatal runtime error: stack overflow`. That is the right failure. A plain assertion failure means the schema was written wrong.
+Expected: the process aborts with `has overflowed its stack` / `fatal runtime error: stack overflow` (`signal: 6, SIGABRT`). That is the right failure. A plain assertion failure means the schema was written wrong.
 
 - [ ] **Step 3: Add the budget**
 
@@ -144,13 +149,13 @@ const MAX_COMPOSITION_DEPTH: usize = 32;
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
 Expected: 16 passed, 0 failed.
 
 - [ ] **Step 5: Check the workspace still builds**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --workspace --all-targets && cargo test --workspace 2>&1 | rg "^test result: FAILED" ; echo "exit $?"`
+Run: `cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace --all-targets && cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace 2>&1 | rg "^test result: FAILED" ; echo "exit $?"`
 
 Expected: `cargo check` clean; the `rg` finds nothing (exit 1 from `rg`, which is the pass condition here).
 
@@ -406,7 +411,7 @@ async fn completion_follows_the_branch_the_document_selects() {
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
 Expected: `branches_without_a_condition_are_inert` passes (nothing descends into `then` yet). Every other new test fails with an empty or wrong `descriptions` vector — `assertion \`left == right\` failed: left: [], right: ["then"]` and so on. A compile error means the test code was mistyped.
 
@@ -489,11 +494,11 @@ In the same `impl<E: Environment> Schemas<E>` block that holds `collect_schemas`
     }
 
     /// The subschemas that apply to the same instance as `schema` itself and
-    /// consume no path: the `if` branch the instance selects, and the schemas
-    /// its present keys depend on.
+    /// consume no path: the `if` branch the instance selects.
     ///
-    /// An absent instance, or a condition that cannot be decided, yields every
-    /// branch, which is what traversal already offers for `oneOf` and `anyOf`.
+    /// An absent instance, or a condition that cannot be decided, yields both
+    /// branches, which is what traversal already offers for `oneOf` and
+    /// `anyOf`.
     async fn conditional_subschemas<'s>(
         &self,
         root_url: &Url,
@@ -521,7 +526,7 @@ In the same `impl<E: Environment> Schemas<E>` block that holds `collect_schemas`
     }
 ```
 
-`conditional_subschemas` grows its dependent-schema half in Task 4; leave the `dependencies` and `dependentSchemas` keywords alone here.
+Leave the `dependencies` and `dependentSchemas` keywords alone here; they arrive in Task 4, which widens this doc comment along with the body.
 
 - [ ] **Step 5: Read the branches in `collect_schemas`**
 
@@ -614,7 +619,7 @@ Pass `instance` unchanged in the `$ref` tail call, the `oneOf` loop, the `anyOf`
 
 - [ ] **Step 7: Run the tests and watch them pass**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
 Expected: 27 passed, 0 failed.
 
@@ -622,7 +627,7 @@ If `an_absent_instance_takes_both_branches` reports `["then"]` only, the `Value:
 
 - [ ] **Step 8: Check the workspace**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --workspace --all-targets && cargo test --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
+Run: `cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace --all-targets && cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
 
 Expected: check clean, `rg exit 1`.
 
@@ -693,21 +698,26 @@ In `crates/taplo-lsp/src/handlers/hover.rs`, inside `mod tests`, add:
     async fn links_follow_the_branch_the_document_selects() {
         let schema = json!({
             "type": "object",
-            "properties": { "kind": { "type": "string" } },
-            "if": { "properties": { "kind": { "const": "docker" } }, "required": ["kind"] },
-            "then": {
-                "properties": {
-                    "image": { "x-taplo": { "links": { "key": "https://example.com/image" } } }
-                }
-            },
-            "else": {
-                "properties": {
-                    "image": { "x-taplo": { "links": { "key": "https://example.com/binary" } } }
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "kind": { "type": "string" } },
+                    "if": { "properties": { "kind": { "const": "docker" } }, "required": ["kind"] },
+                    "then": {
+                        "properties": {
+                            "image": { "x-taplo": { "links": { "key": "https://example.com/image" } } }
+                        }
+                    },
+                    "else": {
+                        "properties": {
+                            "image": { "x-taplo": { "links": { "key": "https://example.com/binary" } } }
+                        }
+                    }
                 }
             }
         });
 
-        let links = links_at(schema, "kind = \"docker\"\nimage = \"nginx\"\n").await;
+        let links = links_at(schema, "[server]\nkind = \"docker\"\nimage = \"nginx\"\n").await;
 
         let targets: Vec<String> = links
             .iter()
@@ -717,6 +727,8 @@ In `crates/taplo-lsp/src/handlers/hover.rs`, inside `mod tests`, add:
         assert_eq!(targets, ["https://example.com/image"]);
     }
 ```
+
+The condition sits inside a table rather than at the root on purpose. The handler serializes each node and passes it beside that node's full path, so the root's own instance is right and only positions below it are wrong; a root-level condition would pass before the fix and prove nothing.
 
 In `crates/taplo-lsp/src/handlers/completion.rs`, inside `mod tests`, add:
 
@@ -742,7 +754,7 @@ and extend its `use` line to `use super::super::hover::tests::{complete_at, comp
 
 - [ ] **Step 2: Run them and watch them fail**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-lsp --lib handlers 2>&1 | tail -30`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-lsp --lib handlers 2>&1 | tail -30`
 
 Expected: compile errors — `cannot find function hover_at_line`, `complete_at_line`, `links_at`. That is the right failure: the fixtures do not exist yet.
 
@@ -862,6 +874,12 @@ In `crates/taplo-lsp/src/handlers/hover.rs`'s `mod tests`, rewrite `hover_at` an
     }
 ```
 
+- [ ] **Step 3b: Run them and watch the links test fail**
+
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-lsp --lib handlers`
+
+Expected: `links_follow_the_branch_the_document_selects` fails with `left: ["https://example.com/image", "https://example.com/binary"]`. `hover_reads_the_branch_the_document_selects` and `key_completion_offers_only_the_selected_branch` already pass: they exercise the previous task's behavior through the real handlers, and live here only because the fixtures they need land here.
+
 - [ ] **Step 4: Serialize the document once in `links.rs`**
 
 In `crates/taplo-lsp/src/handlers/links.rs`, insert before the `for (keys, last_key, node) in …` loop:
@@ -888,19 +906,31 @@ and delete the per-node block inside the loop:
             };
 ```
 
-changing the call that follows to pass `&document`. The loop no longer binds `node`, so change its destructuring to `for (keys, last_key, _) in …`, or drop the third tuple element from the `filter_map` if nothing else reads it — check with `rg -n "node" crates/taplo-lsp/src/handlers/links.rs` before editing.
+Nothing else in the loop reads `node`, so drop it from the `filter_map` and from the destructuring:
+
+```rust
+        for (keys, last_key) in doc.dom.flat_iter().filter_map(|(k, _)| {
+            if let Some(KeyOrIndex::Key(last_key)) = k.iter().last().cloned() {
+                Some((k, last_key))
+            } else {
+                None
+            }
+        }) {
+```
+
+and change the `schemas_at_path` call's second argument from `&value` to `&document`.
 
 - [ ] **Step 5: Run the tests and watch them pass**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-lsp --lib handlers`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-lsp --lib handlers`
 
-Expected: all pass, including the 51 pre-existing `handlers::hover` tests and the 8 pre-existing `handlers::completion` tests.
+Expected: 62 passed, 0 failed — 51 `handlers::hover` and 8 `handlers::completion` from the branch point, plus the three from this task.
 
-If `links_follow_the_branch_the_document_selects` returns both targets, `links.rs` is still passing the node. If it returns none, `config.schema.links` was not set, or the `x-taplo` extension key was mistyped.
+If `links_follow_the_branch_the_document_selects` still returns both targets, `links.rs` is still passing the node. If it returns none, `config.schema.links` was not set, or the `x-taplo` extension key was mistyped.
 
 - [ ] **Step 6: Check the workspace**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --workspace --all-targets && cargo test --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
+Run: `cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace --all-targets && cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
 
 Expected: check clean, `rg exit 1`.
 
@@ -1020,13 +1050,25 @@ async fn the_array_form_of_dependencies_applies_nothing() {
 
 - [ ] **Step 2: Run them and watch them fail**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls dependen`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls dependen`
 
 Expected: `an_absent_trigger_key_applies_nothing` and `the_array_form_of_dependencies_applies_nothing` pass — nothing descends yet, so nothing is found. The other two fail with `left: [], right: ["dependent"]` and `left: [], right: ["from a", "from b"]`.
 
 - [ ] **Step 3: Read the dependent schemas**
 
-In `conditional_subschemas`, before `applicable`'s return:
+Widen `conditional_subschemas`'s doc comment so it describes what the body now does:
+
+```rust
+    /// The subschemas that apply to the same instance as `schema` itself and
+    /// consume no path: the `if` branch the instance selects, and the schemas
+    /// its present keys depend on.
+    ///
+    /// An absent instance, or a condition that cannot be decided, yields every
+    /// branch and every dependent schema, which is what traversal already
+    /// offers for `oneOf` and `anyOf`.
+```
+
+Then, in the body, before `applicable`'s return:
 
 ```rust
         // `dependentSchemas` is the 2019-09 spelling of `dependencies`' schema
@@ -1053,13 +1095,13 @@ In `conditional_subschemas`, before `applicable`'s return:
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
 Expected: 31 passed, 0 failed.
 
 - [ ] **Step 5: Check the workspace**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --workspace --all-targets && cargo test --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
+Run: `cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace --all-targets && cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
 
 Expected: check clean, `rg exit 1`.
 
@@ -1218,7 +1260,7 @@ async fn a_boolean_unevaluated_properties_yields_nothing() {
 
 - [ ] **Step 2: Run them and watch them fail**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls unevaluated`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls unevaluated`
 
 Expected: `an_evaluated_key_does_not_fall_back`, `a_deep_path_asks_about_its_head_key` and `a_boolean_unevaluated_properties_yields_nothing` pass — nothing descends into `unevaluatedProperties` yet. `an_unevaluated_key_falls_back_to_unevaluated_properties` and `a_key_only_the_unselected_branch_evaluates_falls_back` fail with `left: [], right: ["unevaluated"]`.
 
@@ -1334,7 +1376,7 @@ Finally, in `schemas_at_path`, bind the value:
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls`
 
 Expected: 36 passed, 0 failed.
 
@@ -1342,7 +1384,7 @@ If `a_deep_path_asks_about_its_head_key` fails, `evaluated` is being read from a
 
 - [ ] **Step 5: Check the workspace**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --workspace --all-targets && cargo test --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
+Run: `cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace --all-targets && cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"`
 
 Expected: check clean, `rg exit 1`.
 
@@ -1443,7 +1485,7 @@ In `key_hover_sections`, replace the four `if admits_type(…)` blocks — every
 
 - [ ] **Step 2: Run the tests and watch nothing change**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-lsp --lib handlers::hover`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-lsp --lib handlers::hover`
 
 Expected: 51 passed, 0 failed. Any failure means the block was reordered or a call was dropped in the move.
 
@@ -1638,9 +1680,9 @@ In `crates/taplo-lsp/src/handlers/hover.rs`'s `mod tests`:
 
 - [ ] **Step 3: Run them and watch them fail**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls && cargo test -p taplo-lsp --lib handlers::hover`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls && cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-lsp --lib handlers::hover`
 
-Expected: the three traversal tests pass already — traversal never descended into any of the three keywords and still does not; they are the regression guard that it stays that way. The four hover tests fail, three with `left: None, right: Some("- Must not match…")` and `a_subschema_with_nothing_to_show_produces_no_block` passing vacuously.
+Expected: the three traversal tests pass already — traversal never descended into any of the three keywords and still does not; they are the regression guard that it stays that way. Three of the four hover tests fail with `left: None` — `right` is `Some("- Must not match…")` for two of them and `Some("- Properties: …")` for `renders_key_names_and_contains_as_labelled_blocks`. `a_subschema_with_nothing_to_show_produces_no_block` passes vacuously.
 
 - [ ] **Step 4: Add the nested section**
 
@@ -1830,6 +1872,17 @@ fn subschema_facts(schema: &Value) -> Option<Vec<Fact>> {
 }
 ```
 
+`renders_every_section_separated_by_blank_lines` in `mod tests` builds a `HoverSections` field by field, so it needs the new field to keep compiling:
+
+```rust
+            facts: vec![Fact {
+                label: "Default",
+                values: vec!["1".into()],
+            }],
+            nested: Vec::new(),
+        };
+```
+
 At the end of `key_hover_sections`, after the `writeOnly` block and before `sections`:
 
 ```rust
@@ -1846,7 +1899,7 @@ At the end of `key_hover_sections`, after the `writeOnly` block and before `sect
 
 - [ ] **Step 6: Run the tests and watch them pass**
 
-Run: `cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-lsp --lib handlers::hover`
+Run: `cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-lsp --lib handlers::hover`
 
 Expected: 57 passed, 0 failed — 51 from the branch point, two from Task 3, four from this task.
 
@@ -1857,8 +1910,8 @@ If `renders_a_prohibition_as_a_labelled_block` reports a blank line between the 
 Run:
 
 ```bash
-cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --workspace --all-targets && cargo test --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"
-cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --target wasm32-unknown-unknown --manifest-path crates/taplo-wasm/Cargo.toml
+cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace --all-targets && cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace 2>&1 | rg "^test result: FAILED"; echo "rg exit $?"
+cargo check --target wasm32-unknown-unknown --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/crates/taplo-wasm/Cargo.toml
 ```
 
 Expected: check clean, `rg exit 1`, wasm check finishes.
@@ -1890,11 +1943,11 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 After Task 7, with a clean tree:
 
 ```bash
-cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --workspace --all-targets
-cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test --workspace
-cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-common --features schema,reqwest,rustls-tls
-cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo test -p taplo-lsp --lib handlers::hover
-cd /home/lev/Git/lev/taplo-wt/schema-applicators && cargo check --target wasm32-unknown-unknown --manifest-path crates/taplo-wasm/Cargo.toml
+cargo check --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace --all-targets
+cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml --workspace
+cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-common --features schema,reqwest,rustls-tls
+cargo test --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/Cargo.toml -p taplo-lsp --lib handlers::hover
+cargo check --target wasm32-unknown-unknown --manifest-path /home/lev/Git/lev/taplo-wt/schema-applicators/crates/taplo-wasm/Cargo.toml
 git -C /home/lev/Git/lev/taplo-wt/schema-applicators status --short
 ```
 
