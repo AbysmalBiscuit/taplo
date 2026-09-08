@@ -277,7 +277,9 @@ impl<E: Environment> Schemas<E> {
             .with_context(|| format!("reference fragment is not valid UTF-8: {fragment}"))?;
 
         if !pointer.starts_with('/') {
-            return Err(anyhow!("could not resolve reference fragment `{pointer}`"));
+            return anchored_subschema(&document, &document_url, &url)
+                .map(|(anchor_base, schema)| (anchor_base, Arc::new(schema.clone())))
+                .ok_or_else(|| anyhow!("failed to resolve reference `{url}`"));
         }
 
         let mut base = document_url;
@@ -1021,6 +1023,44 @@ fn rebase(base: &Url, schema: &Value) -> Option<Url> {
     let mut url = base.join(id).ok()?;
     url.set_fragment(None);
     Some(url)
+}
+
+/// The subschema in `document` whose `$id` resolves to `url`, with the base it
+/// establishes.
+///
+/// Mirrors the index `jsonschema` builds at compile time: `$id` joins onto the
+/// base in force and re-bases everything beneath it, so a subschema's canonical
+/// URI is the chain of `$id`s above it. `enum` and `const` are skipped, because
+/// their contents are instance data and a key named `$id` inside one is a
+/// value, not an identifier.
+fn anchored_subschema<'d>(document: &'d Value, base: &Url, url: &Url) -> Option<(Url, &'d Value)> {
+    let declared = document["$id"].as_str().and_then(|id| base.join(id).ok());
+
+    // The base returned is the one in force *around* the match, not the one its
+    // own `$id` establishes: the traversal re-bases on entry, and applying it
+    // here as well would join it twice.
+    if declared.as_ref() == Some(url) {
+        return Some((base.clone(), document));
+    }
+
+    let base = declared.map_or_else(
+        || base.clone(),
+        |mut d| {
+            d.set_fragment(None);
+            d
+        },
+    );
+
+    match document {
+        Value::Object(map) => map
+            .iter()
+            .filter(|(k, _)| *k != "enum" && *k != "const")
+            .find_map(|(_, v)| anchored_subschema(v, &base, url)),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| anchored_subschema(item, &base, url)),
+        _ => None,
+    }
 }
 
 /// Whether a subschema names a reference anywhere within it.

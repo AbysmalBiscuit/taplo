@@ -1300,3 +1300,58 @@ async fn a_pointer_crossing_an_id_rebases_beneath_it() {
 
     assert_eq!(descriptions(&found), ["under sub"]);
 }
+
+#[tokio::test]
+async fn a_plain_name_fragment_resolves_to_the_id_that_claims_it() {
+    let (schemas, url) = seeded(json!({
+        "$id": "file:///taplo-test/schema.json",
+        "type": "object",
+        "properties": { "port": { "$ref": "#port" } },
+        "definitions": {
+            "port": { "$id": "#port", "description": "anchored", "type": "integer" }
+        }
+    }))
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["anchored"]);
+}
+
+/// `jsonschema` 0.17.1 indexes `$id` and nothing else, so `$anchor` resolves in
+/// neither half. Asserted of both, so the divergence stays visible rather than
+/// becoming a silent difference between what validates and what completes.
+#[tokio::test]
+async fn an_anchor_keyword_resolves_in_neither_half() {
+    let (schemas, url) = seeded(json!({
+        "$id": "file:///taplo-test/schema.json",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": { "port": { "$ref": "#port" } },
+        "$defs": {
+            "port": { "$anchor": "port", "description": "anchored", "type": "integer" }
+        }
+    }))
+    .await;
+
+    assert!(schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .is_err());
+
+    let errors = schemas
+        .validate(&url, &json!({ "port": "not an integer" }))
+        .await
+        .unwrap();
+
+    assert!(
+        errors.iter().any(|e| matches!(
+            e.kind,
+            jsonschema::error::ValidationErrorKind::InvalidReference { .. }
+        )),
+        "expected an invalid-reference error, got {errors:?}"
+    );
+}
