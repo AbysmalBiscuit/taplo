@@ -4,6 +4,257 @@ use serde_json::json;
 
 const TEST_SCHEMA_URL: &str = "file:///taplo-test/schema.json";
 
+#[tokio::test]
+async fn embedded_resource_children_keep_the_resource_scope() {
+    let (schemas, url) = seeded(json!({
+        "properties": {"server": {"$ref": "defs/network.json#/$defs/server"}},
+        "$defs": {
+            "network": {"$id": "defs/network.json", "$defs": {
+                "server": {"properties": {"port": {"$ref": "port.json"}}}
+            }},
+            "port": {"$id": "defs/port.json", "type": "integer", "description": "Port"}
+        }
+    }))
+    .await;
+    let found = schemas
+        .possible_schemas_from(&url, &json!({"server": {}}), &"server".parse().unwrap(), 2)
+        .await
+        .unwrap();
+    assert_eq!(schema_at(&found, "port").unwrap()["description"], "Port");
+}
+
+#[tokio::test]
+async fn external_references_load_before_validation() {
+    let schemas = Schemas::new(NativeEnvironment::new(), reqwest::Client::new());
+    let url = Url::from_file_path(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema/root.json"),
+    )
+    .unwrap();
+    let invalid = taplo::parser::parse("port = 70000\n").into_dom();
+    let errors = schemas.validate_root(&url, &invalid).await.unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].keys.to_string(), "port");
+    assert!(!errors[0].text_ranges().collect::<Vec<_>>().is_empty());
+    let valid = taplo::parser::parse("port = 443\n").into_dom();
+    assert!(schemas
+        .validate_root(&url, &valid)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn unevaluated_items_skips_positions_covered_by_contains() {
+    let (schemas, url) = seeded(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": { "values": {
+            "contains": {"type": "integer"},
+            "unevaluatedItems": {"type": "string", "description": "Tail"}
+        }}
+    }))
+    .await;
+    let value = json!({"values": [1, "ok"]});
+    let path = "values".parse::<Keys>().unwrap();
+    let head = schemas
+        .schemas_at_path(&url, &value, &path.join(0_usize))
+        .await
+        .unwrap();
+    assert!(head.is_empty());
+    let tail = schemas
+        .schemas_at_path(&url, &value, &path.join(1_usize))
+        .await
+        .unwrap();
+    assert_eq!(descriptions(&tail), ["Tail"]);
+    assert!(schemas.validate(&url, &value).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unevaluated_items_ignores_failed_any_of_branches() {
+    let (schemas, url) = seeded(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": { "values": {
+            "anyOf": [
+                {"prefixItems": [{"const": 1}]},
+                {"prefixItems": [{"const": 2}, {"type": "string"}]}
+            ],
+            "unevaluatedItems": {"type": "string", "description": "Tail"}
+        }}
+    }))
+    .await;
+    let found = schemas
+        .schemas_at_path(
+            &url,
+            &json!({"values": [1, "ok"]}),
+            &"values".parse::<Keys>().unwrap().join(1_usize),
+        )
+        .await
+        .unwrap();
+    assert_eq!(descriptions(&found), ["Tail"]);
+}
+
+#[tokio::test]
+async fn remaining_all_of_preserves_annotations_and_intersects_enums() {
+    let (schemas, url) = seeded(json!({
+        "properties": { "mode": {
+            "description": "Choose a mode",
+            "enum": ["fast", "safe"],
+            "allOf": [{ "type": "string", "enum": ["safe", "other"] }]
+        }}
+    }))
+    .await;
+    let path = "mode".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({"mode": "safe"}), &path)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].1["description"], "Choose a mode");
+    assert_eq!(found[0].1["enum"], json!(["safe"]));
+    let children = schemas
+        .possible_schemas_from(&url, &Value::Null, &Keys::empty(), 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        schema_at(&children, "mode").unwrap()["enum"],
+        json!(["safe"])
+    );
+}
+
+#[tokio::test]
+async fn remaining_embedded_resource_resolves_without_fetching_a_file() {
+    let (schemas, url) = seeded(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": { "port": { "$ref": "defs/network.json#port" } },
+        "$defs": { "network": {
+            "$id": "defs/network.json",
+            "$defs": { "port": { "$anchor": "port", "description": "Network port", "type": "integer" } }
+        }}
+    })).await;
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(descriptions(&found), ["Network port"]);
+    assert!(!schemas
+        .validate(&url, &json!({"port": "bad"}))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(schemas
+        .validate(&url, &json!({"port": 80}))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn remaining_unevaluated_items_validate_and_supply_tail_schemas() {
+    let (schemas, url) = seeded(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": { "values": {
+            "type": "array",
+            "allOf": [{ "prefixItems": [{ "type": "integer", "description": "Head" }] }],
+            "unevaluatedItems": { "type": "string", "description": "Tail", "enum": ["ok"] }
+        }}
+    }))
+    .await;
+    let dom = taplo::parser::parse("values = [1, 2]\n").into_dom();
+    assert!(!schemas.validate_root(&url, &dom).await.unwrap().is_empty());
+    assert!(schemas
+        .validate(&url, &json!({"values": [1, "ok"]}))
+        .await
+        .unwrap()
+        .is_empty());
+    for (index, expected) in [(0_usize, "Head"), (1, "Tail")] {
+        let found = schemas
+            .schemas_at_path(
+                &url,
+                &json!({"values": [1, "ok"]}),
+                &"values".parse::<Keys>().unwrap().join(index),
+            )
+            .await
+            .unwrap();
+        assert_eq!(descriptions(&found), [expected]);
+    }
+}
+
+#[tokio::test]
+async fn dynamic_and_recursive_refs_validate_nested_toml() {
+    for (draft, anchor, reference) in [
+        (
+            "2020-12",
+            json!({"$dynamicAnchor": "node"}),
+            json!({"$dynamicRef": "#node"}),
+        ),
+        (
+            "2019-09",
+            json!({"$recursiveAnchor": true}),
+            json!({"$recursiveRef": "#"}),
+        ),
+    ] {
+        let mut schema = json!({
+            "$schema": format!("https://json-schema.org/draft/{draft}/schema"),
+            "type": "object",
+            "properties": { "value": { "type": "integer" }, "child": reference }
+        });
+        schema
+            .as_object_mut()
+            .unwrap()
+            .extend(anchor.as_object().unwrap().clone());
+        let (schemas, url) = seeded(schema).await;
+        let invalid = taplo::parser::parse("value = 1\n[child]\nvalue = \"bad\"\n").into_dom();
+        let errors = schemas.validate_root(&url, &invalid).await.unwrap();
+        assert_eq!(errors.len(), 1, "{draft}: {errors:?}");
+        assert_eq!(errors[0].keys.to_string(), "child.value");
+        let valid = taplo::parser::parse("value = 1\n[child]\nvalue = 2\n").into_dom();
+        assert!(schemas
+            .validate_root(&url, &valid)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn all_of_required_keys_are_a_union() {
+    let (schemas, url) = seeded(json!({
+        "properties": { "config": {
+            "required": ["a"],
+            "allOf": [{"required": ["a", "b"]}, {"required": ["c"]}]
+        }}
+    }))
+    .await;
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"config".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(found[0].1["required"], json!(["a", "b", "c"]));
+}
+
+#[tokio::test]
+async fn embedded_resource_pointer_keeps_relative_refs_scoped() {
+    let (schemas, url) = seeded(json!({
+        "$id": "https://example.com/root.json",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {"port": {"$ref": "defs/network.json#/$defs/port"}},
+        "$defs": {
+            "network": {"$id": "defs/network.json", "$defs": {"port": {"$ref": "port.json"}}},
+            "port": {"$id": "defs/port.json", "type": "integer", "description": "Port"}
+        }
+    }))
+    .await;
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(descriptions(&found), ["Port"]);
+    assert!(!schemas
+        .validate(&url, &json!({"port": "bad"}))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// Seeds the in-memory schema cache so that lookups never reach the network.
 async fn seeded(schema: Value) -> (Schemas<NativeEnvironment>, Url) {
     let schemas = Schemas::new(NativeEnvironment::new(), reqwest::Client::new());
@@ -392,10 +643,7 @@ async fn self_referential_all_of_terminates_at_a_non_empty_path() {
         .await
         .unwrap();
 
-    assert!(
-        found.is_empty(),
-        "an allOf carrier is not collected, and its only member points back at it"
-    );
+    assert_eq!(descriptions(&found), ["Points back at itself."]);
 }
 
 /// A schema whose `image` key is described differently by each branch of one
@@ -1388,11 +1636,8 @@ async fn a_plain_name_fragment_resolves_to_the_id_that_claims_it() {
     assert_eq!(descriptions(&found), ["anchored"]);
 }
 
-/// `jsonschema` 0.17.1 indexes `$id` and nothing else, so `$anchor` resolves in
-/// neither half. Asserted of both, so the divergence stays visible rather than
-/// becoming a silent difference between what validates and what completes.
 #[tokio::test]
-async fn an_anchor_keyword_resolves_in_neither_half() {
+async fn an_anchor_keyword_resolves_in_both_halves() {
     let (schemas, url) = seeded(json!({
         "$id": "file:///taplo-test/schema.json",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1404,10 +1649,11 @@ async fn an_anchor_keyword_resolves_in_neither_half() {
     }))
     .await;
 
-    assert!(schemas
+    let found = schemas
         .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(descriptions(&found), ["anchored"]);
 
     let errors = schemas
         .validate(&url, &json!({ "port": "not an integer" }))
@@ -1416,10 +1662,10 @@ async fn an_anchor_keyword_resolves_in_neither_half() {
 
     assert!(
         errors.iter().any(|e| matches!(
-            e.kind,
-            jsonschema::error::ValidationErrorKind::InvalidReference { .. }
+            e.kind(),
+            jsonschema::error::ValidationErrorKind::Type { .. }
         )),
-        "expected an invalid-reference error, got {errors:?}"
+        "expected a type error, got {errors:?}"
     );
 }
 
@@ -1669,20 +1915,20 @@ async fn traversal_and_validation_agree_on_every_reference_shape() {
         let errors = schemas
             .validate(&url, &json!({ "port": "not an integer" }))
             .await
-            .unwrap_or_else(|e| panic!("validation failed for `{name}`: {e}"));
+            .unwrap_or_else(|e| panic!("validation failed for `{name}`: {e:#}"));
 
         assert!(
-            errors
-                .iter()
-                .any(|e| matches!(e.kind, jsonschema::error::ValidationErrorKind::Type { .. })),
+            errors.iter().any(|e| matches!(
+                e.kind(),
+                jsonschema::error::ValidationErrorKind::Type { .. }
+            )),
             "validation, `{name}`: expected a type error, got {errors:?}"
         );
 
         assert!(
             !errors.iter().any(|e| matches!(
-                e.kind,
-                jsonschema::error::ValidationErrorKind::Resolver { .. }
-                    | jsonschema::error::ValidationErrorKind::InvalidReference { .. }
+                e.kind(),
+                jsonschema::error::ValidationErrorKind::Referencing(_)
             )),
             "validation, `{name}`: a reference did not resolve, {errors:?}"
         );
@@ -1730,9 +1976,10 @@ async fn a_draft_4_root_resolves_a_relative_reference() {
         .expect("validation errored for a draft-4 root");
 
     assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e.kind, jsonschema::error::ValidationErrorKind::Type { .. })),
+        errors.iter().any(|e| matches!(
+            e.kind(),
+            jsonschema::error::ValidationErrorKind::Type { .. }
+        )),
         "expected a type error, got {errors:?}"
     );
 }

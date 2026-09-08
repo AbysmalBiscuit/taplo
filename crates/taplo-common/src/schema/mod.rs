@@ -2,14 +2,12 @@ use self::{associations::SchemaAssociations, builtins::builtin_schema, cache::Ca
 use crate::{environment::Environment, util::ArcHashValue, LruCache};
 use anyhow::{anyhow, Context};
 use async_recursion::async_recursion;
-use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
-use json_value_merge::Merge;
-use jsonschema::{error::ValidationErrorKind, Draft, JSONSchema, SchemaResolver, ValidationError};
+use jsonschema::{error::ValidationErrorKind, Draft, Retrieve, Uri, ValidationError, Validator};
 use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::Value;
-use std::{borrow::Cow, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 use taplo::{
     dom::{self, node::Key, KeyOrIndex, Keys},
     rowan::TextRange,
@@ -60,7 +58,7 @@ pub struct Schemas<E: Environment> {
     associations: SchemaAssociations<E>,
     concurrent_requests: Arc<Semaphore>,
     http: reqwest::Client,
-    validators: Arc<Mutex<LruCache<Url, Arc<JSONSchema>>>>,
+    validators: Arc<Mutex<LruCache<Url, Arc<Validator>>>>,
     cache: Cache<E>,
 }
 
@@ -126,71 +124,15 @@ impl<E: Environment> Schemas<E> {
                     .with_context(|| format!("failed to load schema {schema_url}"))?;
                 self.add_schema(schema_url, schema.clone()).await;
                 self.add_validator(schema_url.clone(), &schema)
+                    .await
                     .with_context(|| format!("invalid schema {schema_url}"))?
             }
         };
 
-        self.validate_impl(&validator, value).await
-    }
-
-    async fn validate_impl(
-        &self,
-        validator: &JSONSchema,
-        value: &Value,
-    ) -> Result<Vec<ValidationError<'static>>, anyhow::Error> {
-        // The following loop is required for retrieving external schemas.
-        //
-        // We don't know if any external schemas are required until we reach
-        // a validation path that requires it, so we might have to loop many times
-        // to fully validate according to a schema that has many nested references.
-        loop {
-            match validator.validate(value) {
-                Ok(()) => return Ok(Vec::new()),
-                Err(errors) => {
-                    let errors: Vec<_> = errors
-                        .map(|err| ValidationError {
-                            instance: Cow::Owned(err.instance.into_owned()),
-                            kind: err.kind,
-                            instance_path: err.instance_path,
-                            schema_path: err.schema_path,
-                        })
-                        .collect();
-
-                    // We check whether there were any external schema errors,
-                    // and retrieve the schemas accordingly.
-                    let mut external_schema_requests: FuturesUnordered<_> = errors
-                        .iter()
-                        .filter_map(|err| {
-                            if let ValidationErrorKind::Resolver { url, .. } = &err.kind {
-                                Some(async {
-                                    let value = self.load_schema(url).await?;
-                                    drop(self.cache.store(url.clone(), value));
-                                    Result::<(), anyhow::Error>::Ok(())
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    // There are no external schemas to retrieve,
-                    // return the errors as-is.
-                    if external_schema_requests.is_empty() {
-                        drop(external_schema_requests);
-                        return Ok(errors);
-                    }
-
-                    // Retrieve external schemas, and return on the first failure.
-                    while let Some(external_schema_result) = external_schema_requests.next().await {
-                        external_schema_result?;
-                    }
-
-                    // Try validation again, now with external schemas
-                    // resolved and cached.
-                    continue;
-                }
-            };
-        }
+        Ok(validator
+            .iter_errors(value)
+            .map(ValidationError::to_owned)
+            .collect())
     }
 
     pub async fn add_schema(&self, schema_url: &Url, schema: Arc<Value>) {
@@ -227,7 +169,7 @@ impl<E: Environment> Schemas<E> {
         Ok(schema)
     }
 
-    fn get_validator(&self, schema_url: &Url) -> Option<Arc<JSONSchema>> {
+    fn get_validator(&self, schema_url: &Url) -> Option<Arc<Validator>> {
         if self.cache().lru_expired() {
             self.validators.lock().clear();
         }
@@ -235,13 +177,12 @@ impl<E: Environment> Schemas<E> {
         self.validators.lock().get(schema_url).cloned()
     }
 
-    fn add_validator(
+    async fn add_validator(
         &self,
         schema_url: Url,
         schema: &Value,
-    ) -> Result<Arc<JSONSchema>, anyhow::Error> {
-        let scoped = scoped_to(&schema_url, schema);
-        let v = Arc::new(self.create_validator(scoped.as_ref().unwrap_or(schema))?);
+    ) -> Result<Arc<Validator>, anyhow::Error> {
+        let v = Arc::new(self.create_validator(&schema_url, schema).await?);
         self.validators.lock().put(schema_url, v.clone());
         Ok(v)
     }
@@ -262,12 +203,14 @@ impl<E: Environment> Schemas<E> {
         let mut document_url = url.clone();
         document_url.set_fragment(None);
 
-        let document = self.load_schema(&document_url).await?;
-        drop(self.cache.store(document_url.clone(), document.clone()));
+        let (document_base, document) = match self.cache.resource_at(&document_url) {
+            Some(resource) => resource,
+            None => (document_url.clone(), self.load_schema(&document_url).await?),
+        };
 
         let fragment = url.fragment().unwrap_or_default();
         if fragment.is_empty() {
-            return Ok((document_url, document));
+            return Ok((document_base, document));
         }
 
         // A URI fragment is percent-encoded where a JSON pointer is not, so it
@@ -278,12 +221,12 @@ impl<E: Environment> Schemas<E> {
             .with_context(|| format!("reference fragment is not valid UTF-8: {fragment}"))?;
 
         if !pointer.starts_with('/') {
-            return anchored_subschema(&document, &document_url, &url)
+            return anchored_subschema(&document, &document_base, &url)
                 .map(|(anchor_base, schema)| (anchor_base, Arc::new(schema.clone())))
                 .ok_or_else(|| anyhow!("failed to resolve reference `{url}`"));
         }
 
-        let mut base = document_url;
+        let mut base = document_base;
         let mut target = &*document;
 
         for token in pointer.split('/').skip(1) {
@@ -307,40 +250,57 @@ impl<E: Environment> Schemas<E> {
         Ok((base, Arc::new(target.clone())))
     }
 
-    fn create_validator(&self, schema: &Value) -> Result<JSONSchema, anyhow::Error> {
-        let mut options = JSONSchema::options();
-
-        options
-            .with_resolver(CacheSchemaResolver {
+    async fn create_validator(
+        &self,
+        base_url: &Url,
+        schema: &Value,
+    ) -> Result<Validator, anyhow::Error> {
+        let schema = absolute_refs(schema, base_url);
+        let pending = Arc::new(Mutex::new(Vec::new()));
+        let documents = Arc::new(Mutex::new(HashMap::new()));
+        let mut options = jsonschema::options()
+            .with_base_uri(base_url.as_str())
+            .with_retriever(CacheSchemaRetriever {
                 cache: self.cache().clone(),
+                pending: pending.clone(),
+                documents: documents.clone(),
             })
             .with_format("semver", formats::semver)
             .with_format("semver-requirement", formats::semver_req)
-            // `format` is an annotation from 2019-09 on, so setting one of
-            // those drafts would otherwise stop every format from asserting,
-            // including the two registered above.
             .should_validate_formats(true);
 
-        match declared_draft(schema) {
-            // An explicit draft takes precedence over the `$schema` sniffing
-            // in `jsonschema`, which matches meta-schema URIs exactly and so
-            // misses the fragment-less form that 2019-09 and 2020-12 use.
-            DeclaredDraft::Supported(draft) => {
-                options.with_draft(draft);
-            }
+        let draft = match declared_draft(&schema) {
+            DeclaredDraft::Supported(draft) => draft,
             DeclaredDraft::Unsupported(declared) => {
                 tracing::warn!(
                     %declared,
                     used = "draft-07",
                     "schema declares a draft taplo cannot validate, validating as draft-07 instead"
                 );
+                Draft::Draft7
             }
-            DeclaredDraft::Unrecognized => {}
-        }
+            DeclaredDraft::Unrecognized => Draft::Draft7,
+        };
+        options = options.with_draft(draft);
 
-        options
-            .compile(schema)
-            .map_err(|err| anyhow!("invalid schema: {err}"))
+        loop {
+            match options.build(&schema) {
+                Ok(validator) => return Ok(validator),
+                Err(error) => {
+                    let requests = std::mem::take(&mut *pending.lock());
+                    if requests.is_empty() {
+                        return Err(anyhow!("invalid schema: {error}"));
+                    }
+                    for url in requests {
+                        let document = self
+                            .load_schema(&url)
+                            .await
+                            .with_context(|| format!("failed to load referenced schema {url}"))?;
+                        documents.lock().insert(url, document);
+                    }
+                }
+            }
+        }
     }
 
     async fn fetch_external(&self, schema_url: &Url) -> Result<Value, anyhow::Error> {
@@ -402,17 +362,6 @@ impl<E: Environment> Schemas<E> {
 
     /// Whether the instance satisfies a condition, or `None` when the condition
     /// cannot be decided and both branches have to be offered.
-    ///
-    /// A condition that is itself a reference is resolved, one hop, the way
-    /// traversal resolves any schema carrying `$ref`. The references *inside*
-    /// it are made absolute first: a subschema evaluated outside its document
-    /// keeps its `#/...` pointers and loses the document they name, so every
-    /// one of them would fail and the condition would reject every instance.
-    ///
-    /// The condition compiles through `create_validator`, which sees no
-    /// `$schema` on a subschema and so compiles it as draft 7 whatever the root
-    /// declares — the floor a draft-4 root needs, since draft 4 has no `const`
-    /// to discriminate on.
     async fn condition_holds(
         &self,
         base_url: &Url,
@@ -423,61 +372,29 @@ impl<E: Environment> Schemas<E> {
             return None;
         }
 
-        let resolved = self.ref_schema_value(base_url, condition).await;
-        let (base_url, condition) = match &resolved {
-            Some((_, base, schema)) => (base, &**schema),
-            None => (base_url, condition),
-        };
-
-        let condition = absolute_refs(condition, base_url);
-
-        let validator = match self.create_validator(&condition) {
-            Ok(v) => v,
-            Err(error) => {
-                tracing::debug!(%error, "condition could not be compiled");
-                return None;
-            }
-        };
-
-        // A reference is resolved on evaluation rather than on compilation, so
-        // a condition naming a document nothing has fetched compiles cleanly
-        // and reports every instance invalid. `validate` names that case where
-        // `is_valid` cannot, and an unfetched document is retrieved once and
-        // the condition asked again, the way `validate_impl` does it.
-        for attempt in 0..2 {
-            let errors: Vec<_> = match validator.validate(instance) {
-                Ok(()) => return Some(true),
-                Err(errors) => errors.collect(),
-            };
-
-            let mut unresolved = None;
-
-            for error in &errors {
-                match &error.kind {
-                    ValidationErrorKind::Resolver { url, .. } => unresolved = Some(url.clone()),
-                    ValidationErrorKind::InvalidReference { .. } => return None,
-                    _ => {}
-                }
-            }
-
-            let Some(url) = unresolved else {
-                return Some(false);
-            };
-
-            if attempt == 1 {
-                return None;
-            }
-
-            match self.load_schema(&url).await {
-                Ok(value) => drop(self.cache.store(url, value).await),
-                Err(error) => {
-                    tracing::debug!(%error, "condition names a schema that could not be loaded");
-                    return None;
+        let mut condition = absolute_refs(condition, base_url);
+        if let Some(object) = condition.as_object_mut() {
+            object.remove("$id");
+            if let Some(root) = self.cache.get_schema(base_url) {
+                if matches!(
+                    declared_draft(&root),
+                    DeclaredDraft::Supported(Draft::Draft201909 | Draft::Draft202012)
+                ) {
+                    object
+                        .entry("$schema")
+                        .or_insert_with(|| root["$schema"].clone());
                 }
             }
         }
-
-        None
+        // A detached condition must not shadow the document its pointers name.
+        let condition_url = Url::parse("taplo://condition").unwrap();
+        match self.create_validator(&condition_url, &condition).await {
+            Ok(validator) => Some(validator.is_valid(instance)),
+            Err(error) => {
+                tracing::debug!(%error, "condition could not be compiled");
+                None
+            }
+        }
     }
 
     /// The subschemas that apply to the same instance as `schema` itself and
@@ -510,11 +427,7 @@ impl<E: Environment> Schemas<E> {
             applicable.extend(selected.iter().copied().filter(|b| !b.is_null()));
         }
 
-        // `dependentSchemas` is the 2019-09 spelling of `dependencies`' schema
-        // form. Traversal reads whichever a schema happens to carry, the way
-        // it reads `prefixItems` and tuple `items` side by side. The array
-        // form of either names keys rather than a schema, and is skipped by
-        // the object check.
+        // Array dependencies name required keys rather than subschemas.
         for keyword in ["dependencies", "dependentSchemas"] {
             let Some(dependents) = schema[keyword].as_object() else {
                 continue;
@@ -555,6 +468,7 @@ impl<E: Environment> Schemas<E> {
 
         let composition_depth = composition_depth - 1;
 
+        let enclosing_base = base_url;
         let rebased = rebase(base_url, schema);
         let base_url = rebased.as_ref().unwrap_or(base_url);
 
@@ -590,14 +504,23 @@ impl<E: Environment> Schemas<E> {
             return evaluated;
         }
 
+        let composed = self
+            .compose_all_of(enclosing_base, schema, composition_depth, visited)
+            .await;
+        let schema = composed.as_ref().unwrap_or(schema);
+
         let mut evaluated = false;
 
-        if let Some(one_ofs) = schema["oneOf"].as_array() {
-            for one_of in one_ofs {
-                evaluated |= self
+        for keyword in ["oneOf", "anyOf"] {
+            let Some(branches) = schema[keyword].as_array() else {
+                continue;
+            };
+            let mut coverage = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let covers = self
                     .collect_schemas(
                         base_url,
-                        one_of,
+                        branch,
                         value,
                         full_path.clone(),
                         path,
@@ -606,23 +529,20 @@ impl<E: Environment> Schemas<E> {
                         schemas,
                     )
                     .await?;
+                coverage.push(covers);
             }
-        }
-
-        if let Some(any_ofs) = schema["anyOf"].as_array() {
-            for any_of in any_ofs {
-                evaluated |= self
-                    .collect_schemas(
-                        base_url,
-                        any_of,
-                        value,
-                        full_path.clone(),
-                        path,
-                        composition_depth,
-                        visited,
-                        schemas,
-                    )
-                    .await?;
+            if coverage.iter().any(|covers| *covers) {
+                let mut matching = 0;
+                let mut branch_evaluated = false;
+                for (branch, covers) in branches.iter().zip(coverage) {
+                    if self.condition_holds(base_url, branch, value).await != Some(false) {
+                        matching += 1;
+                        branch_evaluated |= covers;
+                    }
+                }
+                if keyword == "anyOf" || matching == 1 {
+                    evaluated |= branch_evaluated;
+                }
             }
         }
 
@@ -658,12 +578,11 @@ impl<E: Environment> Schemas<E> {
                 .await?;
         }
 
-        let include_self = schema["allOf"].is_null();
-
         let Some(key) = path.iter().next() else {
-            if include_self {
-                schemas.push((full_path.clone(), Arc::new(schema.clone())));
-            }
+            schemas.push((
+                full_path.clone(),
+                Arc::new(absolute_refs(schema, enclosing_base)),
+            ));
             return Ok(false);
         };
 
@@ -763,7 +682,9 @@ impl<E: Environment> Schemas<E> {
                 let item_schema = if covered_by_prefix_items {
                     &schema["prefixItems"][idx]
                 } else if schema["items"].is_array() {
-                    &schema["items"][idx]
+                    schema["items"]
+                        .get(*idx)
+                        .unwrap_or(&schema["additionalItems"])
                 } else {
                     &schema["items"]
                 };
@@ -780,6 +701,32 @@ impl<E: Environment> Schemas<E> {
                         schemas,
                     )
                     .await?;
+                evaluated |= !item_schema.is_null();
+
+                if !schema["contains"].is_null()
+                    && self
+                        .condition_holds(base_url, &schema["contains"], &value[idx])
+                        .await
+                        == Some(true)
+                {
+                    evaluated = true;
+                }
+
+                if !evaluated {
+                    let _ = self
+                        .collect_schemas(
+                            base_url,
+                            &schema["unevaluatedItems"],
+                            &value[idx],
+                            full_path.join(*idx),
+                            &child_path,
+                            MAX_COMPOSITION_DEPTH,
+                            &mut Vec::new(),
+                            schemas,
+                        )
+                        .await?;
+                    evaluated |= !schema["unevaluatedItems"].is_null();
+                }
             }
         }
 
@@ -842,6 +789,7 @@ impl<E: Environment> Schemas<E> {
 
         let composition_depth = composition_depth - 1;
 
+        let enclosing_base = base_url;
         let rebased = rebase(base_url, schema);
         let base_url = rebased.as_ref().unwrap_or(base_url);
 
@@ -867,6 +815,11 @@ impl<E: Environment> Schemas<E> {
 
             return;
         }
+
+        let composed = self
+            .compose_all_of(enclosing_base, schema, composition_depth, visited)
+            .await;
+        let schema = composed.as_ref().unwrap_or(schema);
 
         if let Some(one_ofs) = schema["oneOf"].as_array() {
             for one_of in one_ofs {
@@ -920,50 +873,11 @@ impl<E: Environment> Schemas<E> {
             .await;
         }
 
-        // Deal with the { "description": "Foo", "allOf": [{ "$ref": "Bar" }] }
-        // pattern.
-        let composed = [
-            !schema["allOf"].is_null(),
-            !schema["oneOf"].is_null(),
-            !schema["anyOf"].is_null(),
-        ]
-        .into_iter()
-        .filter(|b| *b)
-        .count()
-            == 1
-            && schema["properties"].is_null();
-
         if let Some(all_ofs) = schema["allOf"].as_array() {
-            if !all_ofs.is_empty() && composed {
-                let mut schema = schema.clone();
-                if let Some(obj) = schema.as_object_mut() {
-                    obj.remove("allOf");
-                }
-
-                let mut merged_all_of = Value::Object(serde_json::Map::default());
-                let mut merged_urls = Vec::new();
-
-                for all_of in all_ofs {
-                    match self.ref_schema_value(base_url, all_of).await {
-                        Some((url, target_base, resolved)) => {
-                            if visited.contains(&url) || merged_urls.contains(&url) {
-                                continue;
-                            }
-                            merged_urls.push(url);
-                            merged_all_of.merge(&absolute_refs(&resolved, &target_base));
-                        }
-                        None => merged_all_of.merge(all_of),
-                    }
-                }
-
-                merged_all_of.merge(&schema);
-
-                let merged_count = merged_urls.len();
-                visited.append(&mut merged_urls);
-
+            for all_of in all_ofs {
                 self.collect_child_schemas(
                     base_url,
-                    &merged_all_of,
+                    all_of,
                     root_path,
                     path,
                     instance,
@@ -973,13 +887,11 @@ impl<E: Environment> Schemas<E> {
                     schemas,
                 )
                 .await;
-
-                visited.truncate(visited.len() - merged_count);
             }
-            // TODO: handle allOfs in regular schemas.
         }
 
-        let include_self = !composed;
+        let include_self = schema["oneOf"].is_null() && schema["anyOf"].is_null()
+            || !schema["properties"].is_null();
 
         if include_self {
             schemas.push((
@@ -1007,6 +919,66 @@ impl<E: Environment> Schemas<E> {
                 .await;
             }
         }
+    }
+
+    #[async_recursion(?Send)]
+    async fn compose_all_of(
+        &self,
+        base_url: &Url,
+        schema: &Value,
+        budget: usize,
+        visited: &mut Vec<Url>,
+    ) -> Option<Value> {
+        let all_ofs = schema["allOf"].as_array()?;
+        if budget == 0
+            || !schema["oneOf"].is_null()
+            || !schema["anyOf"].is_null()
+            || !schema["properties"].is_null()
+        {
+            return None;
+        }
+        let enclosing_base = base_url;
+        let rebased = rebase(base_url, schema);
+        let base_url = rebased.as_ref().unwrap_or(base_url);
+        let mut merged = Value::Object(Default::default());
+        for member in all_ofs {
+            let resolved = self.ref_schema_value(base_url, member).await;
+            let (member_base, member) = match &resolved {
+                Some((url, base, value)) => {
+                    if visited.contains(url) {
+                        continue;
+                    }
+                    visited.push(url.clone());
+                    (base, &**value)
+                }
+                None => (base_url, member),
+            };
+            let composed = self
+                .compose_all_of(member_base, member, budget - 1, visited)
+                .await;
+            let member = absolute_refs(composed.as_ref().unwrap_or(member), member_base);
+            merged = merged_all_of(&merged, &member);
+            if resolved.is_some() {
+                visited.pop();
+            }
+        }
+        let mut carrier = absolute_refs(schema, enclosing_base);
+        carrier.as_object_mut()?.remove("allOf");
+        let merged = merged_all_of(&merged, &carrier);
+        // Array evaluation depends on applicator boundaries, which a merge would erase.
+        if [
+            "items",
+            "prefixItems",
+            "contains",
+            "additionalItems",
+            "unevaluatedItems",
+        ]
+        .iter()
+        .any(|keyword| !merged[*keyword].is_null())
+        {
+            return None;
+        }
+        Some(merged)
     }
 
     /// The schema a `$ref` names, with the URL it resolved to and the base in
@@ -1091,42 +1063,30 @@ fn rebase(base: &Url, schema: &Value) -> Option<Url> {
     Some(url)
 }
 
-/// The subschema in `document` whose `$id` resolves to `url`, with the base it
-/// establishes.
-///
-/// Mirrors the index `jsonschema` builds at compile time: `$id` joins onto the
-/// base in force and re-bases everything beneath it, so a subschema's canonical
-/// URI is the chain of `$id`s above it. `enum` and `const` are skipped, because
-/// their contents are instance data and a key named `$id` inside one is a
-/// value, not an identifier.
+/// Find a resource or anchor, retaining the scope around the matching schema.
 fn anchored_subschema<'d>(document: &'d Value, base: &Url, url: &Url) -> Option<(Url, &'d Value)> {
     let declared = document["$id"].as_str().and_then(|id| base.join(id).ok());
-
-    // The base returned is the one in force *around* the match, not the one its
-    // own `$id` establishes: the traversal re-bases on entry, and applying it
-    // here as well would join it twice.
     if declared.as_ref() == Some(url) {
         return Some((base.clone(), document));
     }
-
-    let base = declared.map_or_else(
-        || base.clone(),
-        |mut d| {
-            d.set_fragment(None);
-            d
-        },
-    );
-
-    match document {
-        Value::Object(map) => map
-            .iter()
-            .filter(|(k, _)| *k != "enum" && *k != "const")
-            .find_map(|(_, v)| anchored_subschema(v, &base, url)),
-        Value::Array(items) => items
-            .iter()
-            .find_map(|item| anchored_subschema(item, &base, url)),
-        _ => None,
+    let scope = rebase(base, document).unwrap_or_else(|| base.clone());
+    for keyword in ["$anchor", "$dynamicAnchor"] {
+        if let Some(anchor) = document[keyword].as_str() {
+            let mut anchored = scope.clone();
+            anchored.set_fragment(Some(anchor));
+            if &anchored == url {
+                return Some((base.clone(), document));
+            }
+        }
     }
+    schema_children(document).find_map(|child| anchored_subschema(child, &scope, url))
+}
+
+fn schema_children(schema: &Value) -> impl Iterator<Item = &Value> {
+    Draft::Draft7
+        .subresources_of(schema)
+        .chain(Draft::Draft202012.subresources_of(schema))
+        .unique_by(|child| *child as *const Value)
 }
 
 /// The absolute URL a `$ref` denotes, resolved against the base in force where
@@ -1170,16 +1130,7 @@ fn sibling_overlay(schema: &Value) -> Option<Value> {
     (!overlay.is_empty()).then(|| Value::Object(overlay))
 }
 
-/// `overlay`'s keys win over `base`'s.
-///
-/// Where both hold an object the two merge recursively, which is what carries
-/// `properties`, `patternProperties`, `dependentSchemas` and `x-taplo` — a
-/// sibling `x-taplo.docs` lands beside the target's `x-taplo.links` rather than
-/// erasing it. `const` and `default` are the exception: their objects are
-/// instance data, and merging them would compose a value nobody wrote.
-/// `required` is the union of both, because a validator applying both enforces
-/// both and a sibling `required` was written to add an obligation, not to
-/// cancel one. Every other array is replaced.
+/// Overlay annotations and recursively combine schema maps. Required keys form a union.
 fn merged_over(base: &Value, overlay: &Value) -> Value {
     let (Some(base_map), Some(overlay_map)) = (base.as_object(), overlay.as_object()) else {
         return overlay.clone();
@@ -1210,6 +1161,29 @@ fn merged_over(base: &Value, overlay: &Value) -> Value {
     Value::Object(merged)
 }
 
+fn merged_all_of(base: &Value, overlay: &Value) -> Value {
+    let mut merged = merged_over(base, overlay);
+    if let (Some(left), Some(right)) = (base["enum"].as_array(), overlay["enum"].as_array()) {
+        merged["enum"] = Value::Array(
+            left.iter()
+                .filter(|value| right.contains(value))
+                .cloned()
+                .collect(),
+        );
+    }
+    for keyword in ["properties", "patternProperties", "$defs", "definitions"] {
+        if let (Some(left), Some(right)) = (base[keyword].as_object(), overlay[keyword].as_object())
+        {
+            for (key, value) in right {
+                if let Some(existing) = left.get(key) {
+                    merged[keyword][key] = merged_all_of(existing, value);
+                }
+            }
+        }
+    }
+    merged
+}
+
 /// A copy of `schema` whose every `$ref` string is absolute against `base`.
 ///
 /// A subschema evaluated outside its document keeps its `#/...` pointers and
@@ -1221,14 +1195,22 @@ fn merged_over(base: &Value, overlay: &Value) -> Value {
 fn absolute_refs(schema: &Value, base: &Url) -> Value {
     match schema {
         Value::Object(map) => {
+            let absolute_id = schema["$id"].as_str().and_then(|id| base.join(id).ok());
             let base = rebase(base, schema).unwrap_or_else(|| base.clone());
 
             Value::Object(
                 map.iter()
                     .map(|(key, value)| {
                         let value = match (key.as_str(), value.as_str()) {
-                            ("$ref", Some(reference)) => reference_url(&base, reference)
-                                .map_or_else(|| value.clone(), |u| Value::String(u.into())),
+                            ("$ref" | "$dynamicRef" | "$recursiveRef", Some(reference)) => {
+                                reference_url(&base, reference)
+                                    .map_or_else(|| value.clone(), |u| Value::String(u.into()))
+                            }
+                            ("$id", Some(id)) if id.starts_with('#') => value.clone(),
+                            ("$id", Some(_)) => absolute_id
+                                .as_ref()
+                                .map_or_else(|| value.clone(), |id| Value::String(id.to_string())),
+                            ("enum" | "const" | "default" | "examples", _) => value.clone(),
                             _ => absolute_refs(value, &base),
                         };
                         (key.clone(), value)
@@ -1251,9 +1233,7 @@ enum DeclaredDraft {
     Unrecognized,
 }
 
-/// Classifies the root `$schema`, which is the only one that counts: a
-/// compiled `JSONSchema` carries a single draft, and every document reached
-/// through `$ref` is compiled under it.
+/// Classifies the draft declared by a schema resource.
 fn declared_draft(schema: &Value) -> DeclaredDraft {
     let Some(declared) = schema["$schema"].as_str() else {
         return DeclaredDraft::Unrecognized;
@@ -1282,38 +1262,6 @@ fn declared_draft(schema: &Value) -> DeclaredDraft {
     }
 }
 
-/// A copy of `schema` whose root identifier is absolute against the URL it was
-/// loaded from, or `None` when it already is.
-///
-/// `jsonschema` takes its compilation scope from the root identifier alone and
-/// offers no way to set a base, so a schema without one resolves every relative
-/// reference against `json-schema:///` — a scheme nothing can fetch — and a
-/// schema with a relative one fails to compile at all. Both make the whole
-/// `validate` call error, which reaches the reader as a document with no
-/// diagnostics.
-///
-/// Draft 4 spells the keyword `id`, and that is the one `jsonschema` reads
-/// under that draft, so the draft decides which is written.
-fn scoped_to(schema_url: &Url, schema: &Value) -> Option<Value> {
-    let keyword = match declared_draft(schema) {
-        DeclaredDraft::Supported(Draft::Draft4) => "id",
-        _ => "$id",
-    };
-
-    let scope = match schema[keyword].as_str() {
-        Some(declared) if Url::parse(declared).is_ok() => return None,
-        Some(declared) => reference_url(schema_url, declared)?,
-        None => schema_url.clone(),
-    };
-
-    let mut scoped = schema.clone();
-    scoped
-        .as_object_mut()?
-        .insert(keyword.to_owned(), Value::String(scope.into()));
-
-    Some(scoped)
-}
-
 pub trait ValueExt {
     fn is_schema_ref(&self) -> bool;
     fn schema_ref(&self) -> Option<&str>;
@@ -1329,20 +1277,33 @@ impl ValueExt for Value {
     }
 }
 
-struct CacheSchemaResolver<E: Environment> {
+struct CacheSchemaRetriever<E: Environment> {
     cache: Cache<E>,
+    pending: Arc<Mutex<Vec<Url>>>,
+    documents: Arc<Mutex<HashMap<Url, Arc<Value>>>>,
 }
 
-impl<E: Environment> SchemaResolver for CacheSchemaResolver<E> {
-    fn resolve(
+impl<E: Environment> Retrieve for CacheSchemaRetriever<E> {
+    fn retrieve(
         &self,
-        _root_schema: &serde_json::Value,
-        url: &Url,
-        _original_ref: &str,
-    ) -> Result<Arc<serde_json::Value>, jsonschema::SchemaResolverError> {
-        self.cache
-            .get_schema(url)
-            .ok_or_else(|| WouldBlockError.into())
+        uri: &Uri<String>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = Url::parse(uri.as_str())?;
+        if let Some(schema) = self.documents.lock().get(&url) {
+            return Ok(absolute_refs(schema, &url));
+        }
+        if let Some(schema) = self.cache.get_schema(&url) {
+            self.documents.lock().insert(url.clone(), schema.clone());
+            return Ok(absolute_refs(&schema, &url));
+        }
+        if let Some((base, schema)) = self.cache.resource_at(&url) {
+            return Ok(absolute_refs(&schema, &base));
+        }
+        let mut pending = self.pending.lock();
+        if !pending.contains(&url) {
+            pending.push(url);
+        }
+        Err(WouldBlockError.into())
     }
 }
 
@@ -1363,20 +1324,20 @@ impl NodeValidationError {
         let mut keys = Keys::empty();
         let mut node = root.clone();
 
-        match &error.kind {
+        match error.kind() {
             ValidationErrorKind::AdditionalProperties { unexpected } => {
                 keys = keys.extend(unexpected.iter().map(Key::from).map(KeyOrIndex::Key));
             }
             _ => {}
         }
 
-        'outer: for path in &error.instance_path {
+        'outer: for path in error.instance_path() {
             match path {
-                jsonschema::paths::PathChunk::Property(p) => match node {
+                jsonschema::paths::LocationSegment::Property(p) => match node {
                     dom::Node::Table(t) => {
                         let entries = t.entries().read();
                         for (k, entry) in entries.iter() {
-                            if k.value() == &**p {
+                            if k.value() == p.as_ref() {
                                 keys = keys.join(k.clone());
                                 node = entry.clone();
                                 continue 'outer;
@@ -1386,11 +1347,10 @@ impl NodeValidationError {
                     }
                     _ => return Err(anyhow!("invalid key")),
                 },
-                jsonschema::paths::PathChunk::Index(idx) => {
-                    node = node.try_get(*idx).map_err(|_| anyhow!("invalid index"))?;
-                    keys = keys.join(*idx);
+                jsonschema::paths::LocationSegment::Index(idx) => {
+                    node = node.try_get(idx).map_err(|_| anyhow!("invalid index"))?;
+                    keys = keys.join(idx);
                 }
-                jsonschema::paths::PathChunk::Keyword(_) => {}
             }
         }
 
@@ -1399,7 +1359,7 @@ impl NodeValidationError {
 
     #[must_use]
     pub fn text_ranges(&self) -> Box<dyn Iterator<Item = TextRange> + '_> {
-        match self.error.kind {
+        match self.error.kind() {
             ValidationErrorKind::AdditionalProperties { .. } => {
                 let include_children = false;
 

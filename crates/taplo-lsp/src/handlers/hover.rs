@@ -815,6 +815,84 @@ pub(crate) mod tests {
 
     use crate::world::{DocumentState, WorldState};
 
+    #[tokio::test]
+    async fn all_of_choice_keeps_key_completion() {
+        let schema = json!({
+            "properties": {"mode": {"description": "Mode", "allOf": [{"$ref": "#/$defs/mode"}]}},
+            "$defs": {"mode": {"oneOf": [{"const": "safe"}, {"const": "fast"}]}}
+        });
+        let items = complete_at(schema, "\n", 0).await;
+        assert!(items.iter().any(|item| item.label == "mode"), "{items:?}");
+    }
+
+    #[tokio::test]
+    async fn unevaluated_array_tail_supplies_value_completions() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": { "values": {
+                "type": "array",
+                "allOf": [{"prefixItems": [{"type": "integer"}]}],
+                "unevaluatedItems": {"type": "string", "description": "Tail value", "enum": ["ok"]}
+            }}
+        });
+        let items = complete_at(schema, "values = [1, ]\n", 13).await;
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["\"ok\""]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_of_carrier_keeps_hover_docs_and_valid_completions() {
+        let schema = json!({
+            "properties": { "mode": {
+                "description": "Choose a mode",
+                "enum": ["safe", "fast"],
+                "allOf": [{"$ref": "#/$defs/mode"}]
+            }},
+            "$defs": { "mode": { "type": "string", "enum": ["safe", "other"] } }
+        });
+        let hover = hover_at(schema.clone(), "mode = \"safe\"\n", 1)
+            .await
+            .unwrap();
+        assert!(hover.contains("Choose a mode"), "{hover}");
+        let items = complete_at(schema, "mode = \n", 7).await;
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["\"safe\""]
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_anchor_supplies_hover_and_completion() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "properties": { "mode": { "$ref": "embedded.json#mode" } },
+            "$defs": { "embedded": {
+                "$id": "embedded.json",
+                "$defs": { "mode": { "$anchor": "mode", "description": "Run mode", "enum": ["safe"] } }
+            }}
+        });
+        let hover = hover_at(schema.clone(), "mode = \"safe\"\n", 1)
+            .await
+            .unwrap();
+        assert!(hover.contains("Run mode"), "{hover}");
+        let items = complete_at(schema, "mode = \n", 7).await;
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["\"safe\""]
+        );
+    }
+
     /// Builds a world holding one document and several schemas, the first of
     /// which is associated with the document. Schema paths are relative to
     /// `file:///taplo-test/`.

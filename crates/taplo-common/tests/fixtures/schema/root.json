@@ -1,0 +1,4 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": { "port": { "$ref": "network.json#/$defs/port" } }
+}

@@ -43,6 +43,13 @@ impl<E: Environment> Cache<E> {
         self.schemas.lock().get(url).cloned()
     }
 
+    pub(super) fn resource_at(&self, url: &Url) -> Option<(Url, Arc<Value>)> {
+        self.schemas.lock().iter().find_map(|(base, document)| {
+            super::anchored_subschema(document, base, url)
+                .map(|(base, schema)| (base, Arc::new(schema.clone())))
+        })
+    }
+
     pub fn contains_schema(&self, url: &Url) -> bool {
         self.schemas.lock().contains(url)
     }

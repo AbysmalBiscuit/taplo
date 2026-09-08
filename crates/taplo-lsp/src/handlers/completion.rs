@@ -11,7 +11,13 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use taplo::dom::{node::TableKind, Keys, Node};
+use taplo::{
+    dom::{
+        node::{DomNode, TableKind},
+        Keys, Node,
+    },
+    syntax::SyntaxKind::COMMA,
+};
 use taplo_common::{
     environment::Environment,
     schema::{ext::schema_ext_of, ValueExt},
@@ -326,8 +332,27 @@ pub async fn completion<E: Environment>(
             )));
         }
 
-        let path = if query.is_inline() {
-            lookup_keys(doc.dom.clone(), &path.clone())
+        let path = if query.in_array() {
+            let Some(array) = query
+                .before
+                .as_ref()
+                .or(query.after.as_ref())
+                .and_then(|position| position.syntax.parent())
+            else {
+                return Ok(None);
+            };
+            let Some((array_path, _)) = doc.dom.flat_iter().find(|(_, node)| {
+                node.syntax().and_then(|syntax| syntax.as_node()) == Some(&array)
+            }) else {
+                return Ok(None);
+            };
+            let index = array
+                .children_with_tokens()
+                .filter(|token| token.kind() == COMMA && token.text_range().end() <= offset)
+                .count();
+            array_path.join(index)
+        } else if query.is_inline() {
+            path.clone()
         } else {
             let parent = query.parent_table_or_array_table(&doc.dom);
             let entry_key = query.entry_keys();

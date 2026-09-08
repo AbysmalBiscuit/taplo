@@ -8,7 +8,7 @@ resolver = "2"
 authors      = ["tamasfe"]
 edition      = "2021"
 license      = "MIT"
-rust-version = "1.74"
+rust-version = "1.85"
 homepage     = "https://taplo.tamasfe.dev"
 repository   = "https://github.com/tamasfe/taplo"
 
@@ -34,7 +34,7 @@ reqwest            = { version = "0.11.9", default-features = false }
 rowan              = { version = "0.15.3" }
 schemars           = { version = "0.8.3" }
 serde              = { version = "1" }
-serde_json         = { version = "1.0.78" }
+serde_json         = { version = "1.0.150" }
 sha1               = { version = "0.10.5" }
 tap                = { version = "1.0.1" }
 thiserror          = { version = "1.0.30" }
