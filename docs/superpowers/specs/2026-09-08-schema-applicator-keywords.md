@@ -14,13 +14,14 @@ Probed through the real entry points, with the fixture under "Reproducing the fi
 | `if` / `then` / `else` | `extra` | none | not offered |
 | `not` | `banned` | none | not offered |
 | `dependencies` (schema form) | `b` | none | not offered |
-| `dependencies` (array form) | `b` | none | not offered |
 | `dependentSchemas` | `b` | none | not offered |
 | `unevaluatedProperties` | any key | none | not offered |
 | `propertyNames` | `abc` | none | not offered |
 | `contains` | index `0` | none | not offered |
 
-Eight shapes, nothing found in either direction. `prefixItems` is the ninth item on the tracking issue's checklist and is the exception: the draft-versions feature set closed it in `collect_schemas`, and `prefix_items_resolves_at_covered_index`, `prefix_items_falls_through_to_items_past_the_end` and `items_does_not_apply_at_an_index_prefix_items_covers` in `crates/taplo-common/src/schema/tests.rs` prove it. It is not closed in `collect_child_schemas`, which never walks arrays at all; see "Behavior changes to accept".
+Seven shapes, nothing found in either direction. The array form of `dependencies` was probed too and also finds nothing, which is the correct answer rather than a gap: it names keys and no subschema exists to find.
+
+`prefixItems` is the eighth item on the tracking issue's checklist and is the exception: the draft-versions feature set closed it in `collect_schemas`, and `prefix_items_resolves_at_covered_index`, `prefix_items_falls_through_to_items_past_the_end` and `items_does_not_apply_at_an_index_prefix_items_covers` in `crates/taplo-common/src/schema/tests.rs` prove it. It is not closed in `collect_child_schemas`, which never walks arrays at all; see "Behavior changes to accept".
 
 ### The instance is already there, and nothing reads it
 
@@ -38,7 +39,7 @@ The instance at each position is the instance for that position. No traversal co
 Two exceptions to that invariant, both of which matter once the instance is read:
 
 - `document_link` is the third caller, and it does not hand traversal the document. `crates/taplo-lsp/src/handlers/links.rs` walks `doc.dom.flat_iter()` and serializes each *node*, then calls `schemas_at_path(url, &value, &keys)` with the full `keys` of that node. Traversal then indexes a node by its own path, so every position below the root reads `Value::Null`.
-- The `KeyOrIndex::Key` arm's array-of-tables descent (`schema["items"][k]`) passes `value` unindexed. The arm is near-dead — indexing an array schema by a key name is `Null` for any schema an author would write — but the instance it forwards is the array rather than the table.
+- The `KeyOrIndex::Key` arm's array-of-tables descent (`schema["items"][k]`) passes `value` unindexed, so it forwards the array where its sibling descents forward the member.
 
 ### A half-typed document yields an absent key, never a null
 
@@ -65,14 +66,6 @@ fatal runtime error: stack overflow, aborting
 ```
 
 Hovering a key whose schema is a self-referential `allOf` kills the language server today. This is inherited, not introduced here, but it has to be fixed first: `if`/`then` and `dependentSchemas` are in-place applicators that recurse with the path unchanged, exactly like `allOf`, so every one of them is a new route into the same cycle.
-
-### `collect_schemas` discards a schema that carries `allOf`
-
-`let include_self = schema["allOf"].is_null();` excludes the whole carrier — its `description`, its constraint keywords, everything — whenever it also writes `allOf`. Probed on `{"description": "carrier description", "allOf": [{"$ref": "#/definitions/server"}]}`, `schemas_at_path` at `server` returns one schema, described `"referenced"`. The carrier's own description is gone.
-
-The exclusion arrived upstream beside the composed-`allOf` *merge* in `collect_child_schemas`, where a carrier is folded into its members and including it separately would duplicate it. `collect_schemas` performs no merge, so the exclusion only discards.
-
-This matters here for two reasons. `{"description": …, "allOf": [{"$ref": …}]}` is what `schemars` emits for every documented field, so the field's own documentation is the thing being discarded. And `allOf: [{"if": …, "then": …}, {"if": …, "then": …}]` beside `properties` is how a schema writes more than one conditional, which makes the carrier's exclusion a direct obstacle to this feature set.
 
 ### A condition that names a `$ref` evaluates to false, silently
 
@@ -129,6 +122,8 @@ So the answer to "what does traversal yield for `not`" is *nothing*, and the sam
 
 **Telling the reader that a `then` schema is conditional.** A branch traversal selected applies to the document as it stands, which is what hover states. The `(Keys, Arc<Value>)` a yield carries has no room for a provenance note, and adding one changes a signature three feature sets sit on to footnote something the reader can see in the schema.
 
+**The `allOf` carrier that `collect_schemas` discards.** Argued under "Deferred".
+
 ## Design
 
 ### One rule for the instance
@@ -139,11 +134,13 @@ Every in-place applicator that depends on the document follows the same rule:
 
 `Value::Null` means absent, which the probe above establishes for TOML. Taking every branch is what traversal already does for `oneOf` and `anyOf`: the consumers union what they are given, hover separating alternatives with `---` and completion offering the union of the keys. Over-offering is the failure mode a user can work around; under-offering is the one that reads as completion being broken, which is the tracking issue's own framing.
 
-An absent instance never hides a condition the document had already decided. A condition reads the instance at its own position, so when that position is absent, so is every discriminator the condition could test. "Take no branch" would therefore suppress nothing a document ruled out; it would only empty the completions under a table the user has not created yet.
+An absent instance never hides a condition the document had already decided. A condition reads the instance at its own position, so when that position is absent, so is every discriminator the condition could test. "Take no branch" would therefore suppress nothing a document ruled out; it would only empty the completions under a table the user has not created yet. A present but *empty* object is a different case and is decided, not deferred: `{}` fails a condition that requires a discriminator, so `else` applies.
 
 ### Every caller hands traversal the document
 
 `hover` and `completion` already do. `document_link` does not, and once conditions read the instance, its per-node serialization makes every condition below the root undecidable and attaches links from branches the document has ruled out. It serializes `doc.dom` once, before the loop, and passes that to every `schemas_at_path` call — which is also fewer serializations than it does today.
+
+The `KeyOrIndex::Key` arm's `schema["items"][k]` descent indexes the instance by `k` like its siblings, so every property descent in `collect_schemas` forwards `&value[k.value()]` and the invariant has no exception left.
 
 ### `collect_child_schemas` gains the instance
 
@@ -172,9 +169,7 @@ Handled beside `allOf`, `oneOf` and `anyOf` at the top of both traversal functio
 3. The instance is `Value::Null`, or the resolved condition contains a key `$ref` with a string value anywhere within it, or compiling it fails: **undecidable**. Descend into `then` and into `else`, both with the path unchanged.
 4. Otherwise compile the condition and run the instance through it. Descend into `then` if it is valid, into `else` if it is not.
 
-The schema that carries the `if` keeps being included in its own right, the way a schema carrying `oneOf` does — which is true only once the `allOf` exclusion under "Problem" is gone, since `allOf: [{if, then}, {if, then}]` is how a schema writes more than one conditional.
-
-The condition compiles through the same builder `create_validator` uses — the cache resolver, the two registered formats, `should_validate_formats(true)` — under the root document's declared draft, floored at draft 7. The floor is not cosmetic: `Draft::get_validator` has no `if` arm below draft 7 and no `const` arm for draft 4, so compiling a condition as draft 4 silently drops the `const` that discriminates it, leaving a vacuously true condition that always picks `then`. Flooring keeps traversal draft-agnostic in the way the draft-versions spec settled — it reads whichever keywords a schema happens to carry — rather than reading `if` and then evaluating it under rules that cannot express it. `declared_draft` and `create_validator` are both private to `crates/taplo-common/src/schema/mod.rs`, which is where traversal lives, so nothing changes visibility.
+The condition compiles through `create_validator`, unchanged — the cache resolver, the two registered formats, `should_validate_formats(true)`. A subschema carries no `$schema`, so `declared_draft` reports it unrecognized, `create_validator` sets no draft, and `jsonschema` compiles it under its default, draft 7, whatever the root declares; `a_schema_without_a_declaration_is_draft_7` in `tests.rs` is the proof. That is the floor this needs. `Draft::get_validator` has no `const`, `contains` or `propertyNames` arm for draft 4, so a draft-4 root's condition compiled as draft 4 would lose the `const` that discriminates it and pick `then` vacuously. A 2019-09 or 2020-12 root's condition is likewise evaluated under draft 7; the only keyword that differs inside a condition is `unevaluatedProperties`, and a condition that discriminates on it is out of scope with the `unevaluatedItems` non-goal. Nothing changes visibility: `create_validator` is private to `crates/taplo-common/src/schema/mod.rs`, which is where traversal lives.
 
 The `$ref` scan looks for a key named `$ref` whose value is a *string*, which is what `ValueExt::schema_ref` and `jsonschema` both treat as a reference, so a property literally named `$ref` is not a false positive. `$dynamicRef` and `$recursiveRef` are not scanned for: `jsonschema` 0.17.1 has no arm for either, so validation ignores them too, and treating them as undecidable would make traversal stricter than the validator it exists to agree with.
 
@@ -205,44 +200,28 @@ Selecting the `if` branch and selecting the applicable dependent schemas is the 
 async fn conditional_subschemas<'s>(
     &self,
     root_url: &Url,
-    draft: Option<Draft>,
     schema: &'s Value,
     instance: &Value,
 ) -> Vec<&'s Value>
 ```
 
+The branches it returns are borrowed from `schema`, so a condition resolved through `ref_schema_value` — which yields an owned `Arc<Value>` — is used to compile and then dropped, and never returned. It needs no `async_recursion`: it awaits, but it does not call itself.
+
 The composition keywords keep the loops they already have in both functions. Folding them in would mean cloning every `oneOf` member on every traversal step, which is a cost the current borrow-and-recurse loops do not pay.
 
 ### `unevaluatedProperties`
 
-The specification defines `unevaluatedProperties` against annotations: it applies to the properties that no other applicator in the same schema — including the ones reached in place through `$ref`, `allOf`, `oneOf`, `anyOf`, `if`/`then`/`else` and `dependentSchemas` — evaluated. Traversal collects no annotations, so the question is asked directly instead:
+The specification defines `unevaluatedProperties` against annotations: it applies to the properties that no other applicator in the same schema — including the ones reached in place through `$ref`, `allOf`, `oneOf`, `anyOf`, `if`/`then`/`else` and `dependentSchemas` — evaluated. Traversal collects no annotations, but it walks exactly that closure, one line before the question is asked. So it answers on the way past:
 
-> After the schema's own `properties`, `patternProperties` and `additionalProperties` have had their turn at a key, descend into `unevaluatedProperties` only if no applicator this traversal would follow evaluates that key: the key is not named in `properties`, matches no `patternProperties` pattern, `additionalProperties` is absent, and the same holds recursively of every in-place subschema — `$ref`, `allOf`, `anyOf`, `oneOf`, the selected `if` branch, an applicable dependent schema — within the composition budget.
+> `collect_schemas` returns whether any applicator in this schema's in-place closure evaluates the first segment of `path`. A schema evaluates it when the key is named in its `properties`, matches one of its `patternProperties`, or `additionalProperties` is present in any form. The in-place recursions — `$ref`, `allOf`, `anyOf`, `oneOf`, the selected `if` branch, an applicable dependent schema — share the path, so their answers are OR-ed in; the property and index descents consume the segment, so theirs are discarded. With the path empty, or at an index, the answer is `false`. `unevaluatedProperties` is descended into, consuming the segment, only when the answer is `false`.
 
-```rust
-/// Whether any applicator in `schema` evaluates the property `key`, which is
-/// what `unevaluatedProperties` is defined against.
-///
-/// Every `oneOf` and `anyOf` member counts as evaluating, where the
-/// specification counts only the members the instance satisfies. Traversal
-/// offers the union of the branches everywhere else, and counting only the
-/// satisfied ones here would hide a key another branch already describes.
-async fn evaluates_property(
-    &self,
-    root_url: &Url,
-    draft: Option<Draft>,
-    schema: &Value,
-    instance: &Value,
-    key: &str,
-    composition_depth: usize,
-) -> bool
-```
+This is the predicate `jsonschema`'s own `keywords/unevaluated_properties.rs` compiles: its `compile` reads the parent's `additionalProperties`, `properties`, `patternProperties`, `if`/`then`/`else`, `dependentSchemas`, `$ref`, `allOf`, `anyOf` and `oneOf` and asks each whether it evaluates the property. Asking it of the traversal that already walked the closure costs one `bool` on a return type; asking it of a second recursive walk costs a six-parameter async function that duplicates the first. `schemas_at_path` is the only caller of `collect_schemas` and ignores the value.
 
-This is the shape `jsonschema`'s own `keywords/unevaluated_properties.rs` uses: its `compile` reads the parent's `additionalProperties`, `properties`, `patternProperties`, `if`/`then`/`else`, `dependentSchemas`, `$ref`, `allOf`, `anyOf` and `oneOf`, and asks each whether it evaluates the property.
+Every `oneOf` and `anyOf` member counts as evaluating, where the specification counts only the members the instance satisfies. Traversal offers the union of the branches everywhere else, and counting only the satisfied ones here would hide a key another branch already describes.
 
-**The accumulator shortcut does not work, and this is why.** `collect_schemas` pushes a result only when the remaining path is empty, so every push anywhere in a traversal is for the *target* path. "Nothing has been added to the accumulator since this call began" therefore means "no route from this subtree reached the target", not "no applicator evaluated this key". For the target `a.b` and the schema `{"allOf": [{"properties": {"a": {"type": "object"}}}], "unevaluatedProperties": {"properties": {"b": X}}}`, the member evaluates `a`, its route to `b` dead-ends without pushing, and the shortcut would yield `X` for a key the schema forbids. `additionalProperties: false` is worse: it is not an object, so traversal returns from it immediately, pushes nothing, and the shortcut fires for a key that is explicitly forbidden. The two answers coincide only when the path is exactly one segment long.
+**A cheaper shortcut does not work, and this is why.** The tempting version is to record the accumulator's length on entry and descend into `unevaluatedProperties` when nothing was added. But `collect_schemas` pushes a result only when the remaining path is empty, so every push anywhere in a traversal is for the *target* path. "Nothing has been added" therefore means "no route from this subtree reached the target", not "no applicator evaluated this key". For the target `a.b` and the schema `{"allOf": [{"properties": {"a": {"type": "object"}}}], "unevaluatedProperties": {"properties": {"b": X}}}`, the member evaluates `a`, its route to `b` dead-ends without pushing, and the shortcut yields `X` for a key the schema forbids. `additionalProperties: false` is worse: it is not an object, so traversal returns from it immediately, pushes nothing, and the shortcut fires for a key that is explicitly forbidden. The two answers coincide only when the path is exactly one segment long. The return value asks about the *head key*, which is the question `unevaluatedProperties` is defined against.
 
-It diverges from the specification in one place beyond the `oneOf` union noted in the doc comment: traversal returns at `$ref` without reading the referring object's siblings, so `{"$ref": "…", "unevaluatedProperties": {…}}` loses the keyword along with every other sibling. That gap is inherited, and it belongs with the `$ref` work in the tracking issue.
+It diverges from the specification in one place beyond the `oneOf` union: traversal returns at `$ref` without reading the referring object's siblings, so `{"$ref": "…", "unevaluatedProperties": {…}}` loses the keyword along with every other sibling. That gap is inherited, and it belongs with the `$ref` work in the tracking issue.
 
 A boolean `unevaluatedProperties` needs no special case. `false` is the common spelling and means the key is forbidden; `collect_schemas` returns immediately for a schema that is not an object, so nothing is yielded, which is the right answer for a forbidden key.
 
@@ -302,9 +281,11 @@ It emits `Type`, `Const`, `One of` (from `enum`) and `Required`, then the same c
 
 Without those four, the blocks would be hollow. The body of a `not`, a `propertyNames` or a `contains` is overwhelmingly a `const`, an `enum`, a `type` or a `required`, so a block restricted to constraint keywords would render nothing for most of them, which is the invisibility this feature set exists to end.
 
-A subschema that produces no facts produces no block. A subschema that carries any applicator the block cannot show — `$ref`, `allOf`, `anyOf`, `oneOf`, `not`, `if`, `properties`, `patternProperties`, `additionalProperties`, `items`, `prefixItems`, `contains`, `propertyNames`, `dependentSchemas`, `dependencies`, `unevaluatedProperties` — produces no block either. `subschema_facts` is one level deep, and an incomplete requirement is merely incomplete where an incomplete prohibition is *wrong*: `{"not": {"properties": {"a": {"const": 1}}, "required": ["a"]}}` forbids `a = 1`, and a block reading `Must not match` / `Required: a` would tell the reader to remove `a` altogether. One rule for all three labels, so that a reader never has to know which of them are safe to read partially.
+A subschema produces a block only when every key it carries is one the block can show: a keyword `subschema_facts` renders (`type`, `const`, `enum`, `required`, and the constraint keywords `constraint_facts` reads) or an annotation that constrains nothing (`title`, `description`, `markdownDescription`, `$comment`, `default`, `examples`, `deprecated`, `readOnly`, `writeOnly`, `$id`, `$schema`, `definitions`, `$defs`, `x-taplo`). Any other key — an applicator, or a keyword the list has never heard of — suppresses the block, as does a subschema with no facts to show.
 
-**The type filter's justification is unchanged.** `admits_type` reads the `type` written in the same object as the keyword, and the constraints feature set justified that by the fact that `collect_schemas` never merges a parent's `type` into a child. Nothing here merges a type into anything. `subschema_facts` applies `admits_type` to the subschema it was handed, which is the object those keywords are written in. Every schema this feature set newly yields — `then`, `else`, a dependent schema, an `unevaluatedProperties` schema, and the `allOf` carrier the exclusion used to discard — is yielded whole and unmerged, exactly as `oneOf` members already are.
+An allowlist rather than a blocklist, because the two go stale in opposite directions and only one of them goes stale safely. `subschema_facts` is one level deep, and an incomplete requirement is merely incomplete where an incomplete prohibition is *wrong*: `{"not": {"properties": {"a": {"const": 1}}, "required": ["a"]}}` forbids `a = 1`, and a block reading `Must not match` / `Required: a` would tell the reader to remove `a` altogether. A keyword added to JSON Schema after this is written should cost a missing block, not a wrong one. One rule for all three labels, so that a reader never has to know which of them are safe to read partially.
+
+**The type filter's justification is unchanged.** `admits_type` reads the `type` written in the same object as the keyword, and the constraints feature set justified that by the fact that `collect_schemas` never merges a parent's `type` into a child. Nothing here merges a type into anything. `subschema_facts` applies `admits_type` to the subschema it was handed, which is the object those keywords are written in. Every schema this feature set newly yields — `then`, `else`, a dependent schema, an `unevaluatedProperties` schema — is yielded whole and unmerged, exactly as `oneOf` members already are.
 
 ### Termination
 
@@ -320,59 +301,68 @@ The budget bounds depth, not work. A `$ref` hop costs one unit and its target co
 
 **A composition chain deeper than sixteen `$ref` rounds between two path segments is truncated.** The same limit `collect_child_schemas` has carried since `3cadcb4`, now applied to the other traversal. Sixteen reference hops without descending into a single property is a schema nobody writes; a cycle is what actually reaches the limit.
 
-**A schema carrying `allOf` starts appearing in its own right.** Hover on a `schemars`-style `{"description": …, "allOf": [{"$ref": …}]}` gains a block carrying the field's own documentation above the referenced type's, where today only the referenced type's is shown. Every hover over such a key changes, which is a wide blast radius for a one-line fix; what it restores is text the schema author wrote and Taplo discarded.
-
 **Hover gains blocks, and both hover and completion gain schemas.** A key routed through `then`, a dependent schema or `unevaluatedProperties` produces hover text and completion items where it produced none. A schema carrying `not`, `propertyNames` or `contains` gains a hover block. All of it is the point of the change, and all of it will read as new noise to someone whose schema was quietly half-read before.
 
 **A condition the document cannot decide shows both branches.** Hover over a key inside a `then` whose `if` carries a nested `$ref` shows the `then` block and the `else` block separated by `---`. That is the same shape `oneOf` has always produced.
 
 **Document links follow the document.** `document_link` currently hands traversal a node indexed by its own path, so once conditions are read it would see `Value::Null` everywhere. Passing the whole document changes which links it emits for a conditional schema, and reduces its serializations from one per node to one per request.
 
+**Two `allOf` members that each carry an `if` are blended into one condition inside `collect_child_schemas`.** Its composed-`allOf` branch deep-merges members through `json_value_merge` before descending, so two `if` objects become one merged object. Pre-existing, unobservable until conditions are read, and not fixable without unpicking the merge the composed-`allOf` shape depends on. `collect_schemas` performs no merge and is unaffected, so hover and the completion *start point* see the conditions separately; only completion's descent into hypothetical child keys sees the blend.
+
 **`prefixItems` still does not reach completion.** `collect_child_schemas` walks `properties` and nothing else — not `items`, not `prefixItems`, not any array keyword — so the draft-versions feature set's `prefixItems` support reaches `schemas_at_path` and stops there. Teaching completion to enumerate array positions is not an applicator problem: a completion item is a key name, and an array index is not one. Unchanged here, and named so the next reader does not mistake it for a gap this feature set opened.
 
-**A carrier reached through a property descent inside `collect_child_schemas` still skips its `allOf` members.** The `// TODO: handle allOfs in regular schemas` branch is untouched, so header completion below such a carrier misses conditionals written inside its members. Closing it means walking members for their children without pushing the members themselves, which is what the composed-`allOf` merge exists to avoid; it is not an applicator problem and it is not opened here.
+**A carrier reached through a property descent inside `collect_child_schemas` still skips its `allOf` members.** The `// TODO: handle allOfs in regular schemas` branch is untouched, so header completion below such a carrier misses conditionals written inside its members. Closing it means walking members for their children without pushing the members themselves, which is what the composed-`allOf` merge exists to avoid.
+
+## Deferred
+
+**`collect_schemas` discards a schema that carries `allOf`.** `let include_self = schema["allOf"].is_null();` excludes the whole carrier — its `description`, its constraint keywords, everything — whenever it also writes `allOf`. Probed on `{"description": "carrier description", "allOf": [{"$ref": "#/definitions/server"}]}`, `schemas_at_path` at `server` returns one schema, described `"referenced"`. The carrier's own description is gone. `allOf` is the only composition keyword whose carrier is dropped: an `anyOf` or `oneOf` carrier is yielded beside its members. `schemars` emits the `allOf` shape for a documented field whose type is a reference and not an `Option`, and the `Option` case becomes an `anyOf` carrier, so whether a field's documentation survives depends on whether the field is optional.
+
+It is deferred rather than fixed, because the one-line change is not one line. Probed with `include_self = true` through the real handlers:
+
+- Hover renders the carrier's block *after* the referenced type's, because the carrier is pushed after the `allOf` loop. Leading with the field's own text means moving the push, which also reorders every `anyOf` and `oneOf` carrier.
+- Value completion doubles. `schemas_at_path` yields both the carrier and the target; `possible_schemas_from` then runs `collect_child_schemas` on each, the carrier merges into the target and the target yields itself, the two differ by a `description`, so `unique_by` keeps both — and `add_value_completions` deduplicates by label within one schema rather than across the set, which is the annotation feature set's deliberate contract. Every `enum` value under such a carrier is offered twice.
+
+Closing it therefore means changing a completion contract a previous feature set argued for, on top of a traversal change with a blast radius of every hover over an `allOf` carrier. That is its own feature set, and none of this one depends on it: a conditional written as `allOf: [{if, then}, {if, then}]` still works, because the `if` sits inside the member that traversal does descend into. What is lost is only the carrier's own annotations at the target path, which were lost before this feature set too.
 
 ## Acceptance criteria
 
-Traversal criteria run against `schemas_at_path` and `possible_schemas_from` in `crates/taplo-common/src/schema/tests.rs`. Rendering criteria run against the real `hover` handler through `hover_at`, and completion criteria against the real `completion` handler through `complete_at`, both in `crates/taplo-lsp/src/handlers/hover.rs`'s `mod tests`.
+Traversal criteria run against `schemas_at_path` and `possible_schemas_from` in `crates/taplo-common/src/schema/tests.rs`. Rendering criteria run against the real `hover` handler and completion criteria against the real `completion` handler, through `hover_at` and `complete_at` in `crates/taplo-lsp/src/handlers/hover.rs`'s `mod tests`. Both helpers gain a `line` parameter — every existing caller passes `0` — because a conditional's discriminator and the key it selects sit on different lines. Criterion 19 runs through a new `links_at(schema, source) -> Vec<DocumentLink>` beside them, built on `world_with` with `ws.config.schema.links` set, since the default disables the handler.
 
 1. `schemas_at_path` at the non-empty path `node`, on the self-referential `allOf` schema from `self_referential_all_of_terminates`, returns without overflowing the stack.
-2. `schemas_at_path` at `server`, on `{"description": "carrier", "allOf": [{"$ref": "#/definitions/server"}]}`, returns both the carrier and the referenced schema, and hover on that key renders the carrier's description.
-3. Given `{"if": {"properties": {"kind": {"const": "docker"}}, "required": ["kind"]}, "then": {"properties": {"image": {…}}}, "else": {"properties": {"image": {…}}}}`, `schemas_at_path` at `image` against the instance `{"kind": "docker"}` returns the `then` schema and not the `else` schema, and against `{"kind": "podman"}` returns the `else` schema and not the `then` schema.
-4. The same schema with the instance `Value::Null` returns both branches.
-5. A condition containing a nested `$ref` returns both branches, rather than the `else` branch alone; a condition that is *itself* a `$ref` to a reference-free subschema is resolved and decides the branch.
-6. A condition that does not compile — `{"if": {"pattern": "("}}` — returns both branches.
-7. A root declaring draft 4 still decides a `const` condition, rather than taking `then` vacuously.
-8. `then` or `else` without an `if` yields nothing; the schema carrying the `if` is still yielded in its own right alongside the selected branch, including when it also carries `allOf`.
-9. Hover on a key reached through `then` renders that branch's documentation, through the real handler, on a document whose discriminator selects it.
-10. Completion on a partial key offers the keys of the selected branch and not the keys of the other, through the real handler.
-11. `dependencies` in schema form and `dependentSchemas` both yield their subschema at the object's path when the trigger key is present in the instance, and neither yields it when the instance is present without the trigger key.
-12. Both yield every dependent subschema when the instance is absent.
-13. `dependencies` in array form, and `dependentRequired`, yield nothing.
-14. `unevaluatedProperties` yields its schema for a key that `properties`, `patternProperties` and `additionalProperties` do not cover, and does not yield it for a key any of the three covers.
-15. `unevaluatedProperties` does not yield for a key an `allOf`, `oneOf`, `anyOf`, selected `if` branch or applicable dependent schema covers, and does yield for a key only the *unselected* branch covers.
-16. At the two-segment path `a.b`, `{"allOf": [{"properties": {"a": {"type": "object"}}}], "unevaluatedProperties": {…}}` yields nothing from `unevaluatedProperties`, and neither does the same schema with `additionalProperties: false` in place of the `allOf`.
-17. A boolean `unevaluatedProperties` yields nothing.
-18. `not`, `propertyNames` and `contains` yield nothing: the negated subschema's `properties` are not offered as completion keys, its constraint keywords do not appear in hover as requirements, `propertyNames` is not returned as the schema for a value, and `contains` is not returned as the schema for an array index.
-19. Hover renders `Must not match`, `Key names` and `Contains` as labelled blocks with the subschema's facts indented beneath, after the flat facts, with no blank line between the flat list and the blocks.
-20. A subschema with no renderable facts produces no block, and neither does one carrying any applicator keyword listed under "Hover renders a nested block", asserted for `{"not": {"properties": {"a": {"const": 1}}, "required": ["a"]}}`.
-21. `document_link` resolves against the whole document: a link declared in a `then` branch is emitted for a document whose discriminator selects that branch.
-22. Every schema `schemas_at_path` and `possible_schemas_from` returned before this feature set is still returned, apart from the `allOf` carrier that is now additionally returned: the 15 tests in `crates/taplo-common/src/schema/tests.rs` and the 51 in `cargo test -p taplo-lsp --lib handlers::hover` pass.
-23. `cargo check --workspace --all-targets`, `cargo test --workspace`, `cargo test -p taplo-common --features schema,reqwest,rustls-tls` and `cargo check --target wasm32-unknown-unknown --manifest-path crates/taplo-wasm/Cargo.toml` are all clean.
+2. Given `{"if": {"properties": {"kind": {"const": "docker"}}, "required": ["kind"]}, "then": {"properties": {"image": {…}}}, "else": {"properties": {"image": {…}}}}`, `schemas_at_path` at `image` against the instance `{"kind": "docker"}` returns the `then` schema and not the `else` schema, and against `{"kind": "podman"}` returns the `else` schema and not the `then` schema.
+3. The same schema returns both branches for the instance `Value::Null`, and the `else` branch alone for the present but empty instance `{}`.
+4. A condition containing a nested `$ref` returns both branches, rather than the `else` branch alone; a condition that is *itself* a `$ref` to a reference-free subschema is resolved and decides the branch.
+5. A condition that does not compile — `{"if": {"pattern": "("}}` — returns both branches.
+6. A root declaring draft 4 still decides a `const` condition, rather than taking `then` vacuously.
+7. `then` or `else` without an `if` yields nothing, and the schema carrying the `if` is still yielded in its own right alongside the selected branch.
+8. Hover on a key reached through `then` renders that branch's documentation, through the real handler, on a document whose discriminator is on an earlier line.
+9. Completion on a partial key offers the keys of the selected branch and not the keys of the other, through the real handler.
+10. `dependencies` in schema form and `dependentSchemas` both yield their subschema at the object's path when the trigger key is present in the instance, and neither yields it when the instance is present without the trigger key.
+11. Both yield every dependent subschema when the instance is absent.
+12. `dependencies` in array form, and `dependentRequired`, yield nothing.
+13. `unevaluatedProperties` yields its schema for a key that `properties`, `patternProperties` and `additionalProperties` do not cover, and does not yield it for a key any of the three covers, `additionalProperties: false` included.
+14. `unevaluatedProperties` does not yield for a key an `allOf`, `oneOf`, `anyOf`, selected `if` branch or applicable dependent schema covers, and does yield for a key only the *unselected* branch covers.
+15. At the two-segment path `a.b`, `{"allOf": [{"properties": {"a": {"type": "object"}}}], "unevaluatedProperties": {…}}` yields nothing from `unevaluatedProperties`, and neither does the same schema with `additionalProperties: false` in place of the `allOf`.
+16. A boolean `unevaluatedProperties` yields nothing.
+17. `not`, `propertyNames` and `contains` yield nothing: the negated subschema's `properties` are not offered as completion keys, its constraint keywords do not appear in hover as requirements, `propertyNames` is not returned as the schema for a value, and `contains` is not returned as the schema for an array index.
+18. Hover renders `Must not match`, `Key names` and `Contains` as labelled blocks with the subschema's facts indented beneath, after the flat facts, with no blank line between the flat list and the blocks.
+19. `document_link` resolves against the whole document: a link declared in a `then` branch is emitted for a document whose discriminator selects that branch.
+20. A subschema with no renderable facts produces no block, and neither does one carrying a key outside the allowlist, asserted for `{"not": {"properties": {"a": {"const": 1}}, "required": ["a"]}}` and for `{"not": {"dependentRequired": {"a": ["b"]}, "required": ["a"]}}`.
+21. Every schema `schemas_at_path` and `possible_schemas_from` returned before this feature set is still returned: the 15 tests in `crates/taplo-common/src/schema/tests.rs` and the 51 in `cargo test -p taplo-lsp --lib handlers::hover` pass.
+22. `cargo check --workspace --all-targets`, `cargo test --workspace`, `cargo test -p taplo-common --features schema,reqwest,rustls-tls` and `cargo check --target wasm32-unknown-unknown --manifest-path crates/taplo-wasm/Cargo.toml` are all clean.
 
 ## Landing
 
-Seven commits on `feat/schema-applicators`, each building and passing on its own. This is one branch in a stack of five, so these are commits rather than separate pull requests; the branch opens one pull request.
+Six commits on `feat/schema-applicators`, each building and passing on its own. This is one branch in a stack of five, so these are commits rather than separate pull requests; the branch opens one pull request.
 
 1. `fix(schema): bound composition depth in collect_schemas` — the stack overflow, with the probe from "Problem" turned into a regression test. First, because every in-place applicator that follows is a new route into the cycle it closes. Criterion 1.
-2. `fix(schema): keep a schema that carries allOf` — the `include_self` exclusion. Second, because the claim that a conditional's carrier is yielded in its own right depends on it. Criterion 2.
-3. `feat(schema): pick the applicable if/then/else branch` — `conditional_subschemas`, condition compilation against the root's draft floored at 7, the `$ref` hop and the nested-`$ref` scan, `instance_at`, the instance parameter on `collect_child_schemas`, and `document_link` passing the document. Criteria 3 through 10, and 21.
-4. `feat(schema): apply schemas a present key depends on` — `dependencies` in schema form and `dependentSchemas`, through `conditional_subschemas`. Criteria 11 through 13.
-5. `feat(schema): fall back to unevaluatedProperties` — `evaluates_property`. Criteria 14 through 17.
-6. `refactor(lsp): extract constraint_facts from key_hover_sections` — mechanical, no behavior change, so that the commit that follows is only behavior.
-7. `feat(lsp): render not, propertyNames and contains` — `NestedFacts`, `subschema_facts`, and the traversal tests that prove the three keywords yield nothing. Criteria 18 through 20.
+2. `feat(schema): pick the applicable if/then/else branch` — `conditional_subschemas`, condition compilation through `create_validator`, the `$ref` hop and the nested-`$ref` scan, `instance_at`, the instance parameter on `collect_child_schemas`, the array-of-tables descent indexing its instance, `document_link` passing the document, and the `line` parameter and `links_at` fixture the criteria need. Criteria 2 through 9, and 19.
+3. `feat(schema): apply schemas a present key depends on` — `dependencies` in schema form and `dependentSchemas`, through `conditional_subschemas`. Criteria 10 through 12.
+4. `feat(schema): fall back to unevaluatedProperties` — the `bool` return on `collect_schemas`. Criteria 13 through 16.
+5. `refactor(lsp): extract constraint_facts from key_hover_sections` — mechanical, no behavior change, so that the commit that follows is only behavior.
+6. `feat(lsp): render not, propertyNames and contains` — `NestedFacts`, `subschema_facts`, and the traversal tests that prove the three keywords yield nothing. Criteria 17, 18 and 20.
 
-The split is by keyword because that is the boundary a reviewer can reject one side of. The argument about what `not` yields shares no code with the argument about how `unevaluatedProperties` decides coverage, and commit 3's instance threading is the only thing commits 4 and 5 borrow. Commits 4 and 5 do not fold together: `evaluates_property` has to ask whether a dependent schema covers a key, so it depends on commit 4, and it carries the argument a reviewer is likeliest to want to reject on its own.
+The split is by keyword because that is the boundary a reviewer can reject one side of. The argument about what `not` yields shares no code with the argument about how `unevaluatedProperties` decides coverage, and commit 2's instance threading is the only thing commits 3 and 4 borrow. Commits 3 and 4 do not fold together: the coverage answer has to account for a dependent schema, so it depends on commit 3, and it carries the argument a reviewer is likeliest to want to reject on its own.
 
 ## Reproducing the findings
 
@@ -381,6 +371,8 @@ The traversal, `allOf`-exclusion and validator tables came from `#[tokio::test]`
 The instance-threading table needed a temporary `println!` beside the `schemas.push` in `collect_schemas`, since nothing reads the instance today and it is therefore not observable from outside.
 
 The DOM serialization table came from a `#[tokio::test]` in `crates/taplo-lsp/src/handlers/hover.rs` calling `serde_json::to_value(&taplo::parser::parse(src).into_dom())`.
+
+The doubled value completions under "Deferred" came from flipping `include_self` to `true` and running `hover_at` and `complete_at` against a carrier over an `enum`-bearing definition.
 
 Every probe was reverted; the baseline at `777833a` is unchanged.
 
