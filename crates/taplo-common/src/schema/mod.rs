@@ -358,6 +358,72 @@ impl<E: Environment> Schemas<E> {
         Ok(schemas)
     }
 
+    /// Whether the instance satisfies a condition, or `None` when the
+    /// condition cannot be decided and both branches have to be offered.
+    ///
+    /// A condition that is itself a reference is resolved, one hop, the way
+    /// traversal resolves any schema carrying `$ref`. The condition compiles
+    /// through `create_validator`, which sees no `$schema` on a subschema and
+    /// so compiles it as draft 7 whatever the root declares — the floor a
+    /// draft-4 root needs, since draft 4 has no `const` to discriminate on.
+    async fn condition_holds(
+        &self,
+        root_url: &Url,
+        condition: &Value,
+        instance: &Value,
+    ) -> Option<bool> {
+        if instance.is_null() {
+            return None;
+        }
+
+        let resolved = self.ref_schema_value(root_url, condition).await;
+        let condition = resolved.as_deref().unwrap_or(condition);
+
+        if names_a_ref(condition) {
+            return None;
+        }
+
+        match self.create_validator(condition) {
+            Ok(validator) => Some(validator.is_valid(instance)),
+            Err(error) => {
+                tracing::debug!(%error, "condition could not be compiled");
+                None
+            }
+        }
+    }
+
+    /// The subschemas that apply to the same instance as `schema` itself and
+    /// consume no path: the `if` branch the instance selects.
+    ///
+    /// An absent instance, or a condition that cannot be decided, yields both
+    /// branches, which is what traversal already offers for `oneOf` and
+    /// `anyOf`.
+    async fn conditional_subschemas<'s>(
+        &self,
+        root_url: &Url,
+        schema: &'s Value,
+        instance: &Value,
+    ) -> Vec<&'s Value> {
+        let mut applicable = Vec::new();
+
+        let branches = [&schema["then"], &schema["else"]];
+
+        if !schema["if"].is_null() && branches.iter().any(|branch| !branch.is_null()) {
+            let selected: &[&Value] = match self
+                .condition_holds(root_url, &schema["if"], instance)
+                .await
+            {
+                Some(true) => &branches[..1],
+                Some(false) => &branches[1..],
+                None => &branches,
+            };
+
+            applicable.extend(selected.iter().copied().filter(|b| !b.is_null()));
+        }
+
+        applicable
+    }
+
     #[tracing::instrument(skip_all, fields(%path))]
     #[async_recursion(?Send)]
     #[must_use]
@@ -440,6 +506,19 @@ impl<E: Environment> Schemas<E> {
             }
         }
 
+        for conditional in self.conditional_subschemas(root_url, schema, value).await {
+            self.collect_schemas(
+                root_url,
+                conditional,
+                value,
+                full_path.clone(),
+                path,
+                composition_depth,
+                schemas,
+            )
+            .await?;
+        }
+
         let include_self = schema["allOf"].is_null();
 
         let Some(key) = path.iter().next() else {
@@ -457,7 +536,7 @@ impl<E: Environment> Schemas<E> {
                 self.collect_schemas(
                     root_url,
                     &schema["items"][k.value()],
-                    value,
+                    &value[k.value()],
                     full_path.join(k.clone()),
                     &child_path,
                     MAX_COMPOSITION_DEPTH,
@@ -555,6 +634,7 @@ impl<E: Environment> Schemas<E> {
                 &schema,
                 &path,
                 &Keys::empty(),
+                instance_at(value, &path),
                 max_depth,
                 MAX_COMPOSITION_DEPTH,
                 &mut children,
@@ -579,6 +659,7 @@ impl<E: Environment> Schemas<E> {
         schema: &Value,
         root_path: &Keys,
         path: &Keys,
+        instance: &Value,
         mut depth: usize,
         composition_depth: usize,
         schemas: &mut Vec<(Keys, Keys, Arc<Value>)>,
@@ -596,6 +677,7 @@ impl<E: Environment> Schemas<E> {
                     &schema,
                     root_path,
                     path,
+                    instance,
                     depth,
                     composition_depth,
                     schemas,
@@ -610,6 +692,7 @@ impl<E: Environment> Schemas<E> {
                     one_of,
                     root_path,
                     path,
+                    instance,
                     depth,
                     composition_depth,
                     schemas,
@@ -625,12 +708,30 @@ impl<E: Environment> Schemas<E> {
                     any_of,
                     root_path,
                     path,
+                    instance,
                     depth,
                     composition_depth,
                     schemas,
                 )
                 .await;
             }
+        }
+
+        for conditional in self
+            .conditional_subschemas(root_url, schema, instance)
+            .await
+        {
+            self.collect_child_schemas(
+                root_url,
+                conditional,
+                root_path,
+                path,
+                instance,
+                depth,
+                composition_depth,
+                schemas,
+            )
+            .await;
         }
 
         // Deal with the { "description": "Foo", "allOf": [{ "$ref": "Bar" }] }
@@ -669,6 +770,7 @@ impl<E: Environment> Schemas<E> {
                     &merged_all_of,
                     root_path,
                     path,
+                    instance,
                     depth,
                     composition_depth,
                     schemas,
@@ -697,6 +799,7 @@ impl<E: Environment> Schemas<E> {
                     v,
                     root_path,
                     &path.join(Key::from(k)),
+                    &instance[k],
                     depth,
                     MAX_COMPOSITION_DEPTH,
                     schemas,
@@ -729,6 +832,39 @@ impl<E: Environment> Schemas<E> {
         } else {
             None
         }
+    }
+}
+
+/// The part of the document a schema at `keys` applies to.
+///
+/// Indexing a `Value` with a missing key or an out-of-range index yields
+/// `Value::Null`, which is how an absent position reports itself.
+fn instance_at<'v>(value: &'v Value, keys: &Keys) -> &'v Value {
+    let mut instance = value;
+
+    for key in keys.iter() {
+        instance = match key {
+            KeyOrIndex::Key(k) => &instance[k.value()],
+            KeyOrIndex::Index(idx) => &instance[*idx],
+        };
+    }
+
+    instance
+}
+
+/// Whether a subschema names a reference anywhere within it.
+///
+/// A subschema compiled on its own keeps its `#/...` pointers and loses the
+/// document they point into, so every reference fails to resolve and the
+/// subschema rejects every instance. A condition that names one is therefore
+/// undecidable rather than false.
+fn names_a_ref(schema: &Value) -> bool {
+    match schema {
+        Value::Object(map) => {
+            map.get("$ref").is_some_and(Value::is_string) || map.values().any(names_a_ref)
+        }
+        Value::Array(items) => items.iter().any(names_a_ref),
+        _ => false,
     }
 }
 

@@ -397,3 +397,217 @@ async fn self_referential_all_of_terminates_at_a_non_empty_path() {
         "an allOf carrier is not collected, and its only member points back at it"
     );
 }
+
+/// A schema whose `image` key is described differently by each branch of one
+/// condition, so that the description names the branch that was taken.
+fn conditional_schema() -> Value {
+    json!({
+        "type": "object",
+        "if": {
+            "properties": { "kind": { "const": "docker" } },
+            "required": ["kind"]
+        },
+        "then": { "properties": { "image": { "type": "string", "description": "then" } } },
+        "else": { "properties": { "image": { "type": "string", "description": "else" } } }
+    })
+}
+
+#[tokio::test]
+async fn a_met_condition_selects_the_then_branch() {
+    let (schemas, url) = seeded(conditional_schema()).await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "kind": "docker" }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["then"]);
+}
+
+#[tokio::test]
+async fn an_unmet_condition_selects_the_else_branch() {
+    let (schemas, url) = seeded(conditional_schema()).await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "kind": "podman" }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["else"]);
+}
+
+#[tokio::test]
+async fn an_absent_instance_takes_both_branches() {
+    let (schemas, url) = seeded(conditional_schema()).await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["then", "else"]);
+}
+
+#[tokio::test]
+async fn an_empty_instance_decides_the_condition() {
+    let (schemas, url) = seeded(conditional_schema()).await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({}), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["else"]);
+}
+
+#[tokio::test]
+async fn a_condition_that_is_a_reference_is_resolved() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "if": { "$ref": "#/definitions/docker" },
+        "then": { "properties": { "image": { "description": "then" } } },
+        "else": { "properties": { "image": { "description": "else" } } },
+        "definitions": {
+            "docker": {
+                "properties": { "kind": { "const": "docker" } },
+                "required": ["kind"]
+            }
+        }
+    }))
+    .await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "kind": "docker" }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["then"]);
+}
+
+#[tokio::test]
+async fn a_condition_holding_a_nested_reference_takes_both_branches() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "if": {
+            "properties": { "kind": { "$ref": "#/definitions/docker" } },
+            "required": ["kind"]
+        },
+        "then": { "properties": { "image": { "description": "then" } } },
+        "else": { "properties": { "image": { "description": "else" } } },
+        "definitions": { "docker": { "const": "docker" } }
+    }))
+    .await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "kind": "docker" }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["then", "else"]);
+}
+
+#[tokio::test]
+async fn a_condition_that_does_not_compile_takes_both_branches() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "if": { "pattern": "(" },
+        "then": { "properties": { "image": { "description": "then" } } },
+        "else": { "properties": { "image": { "description": "else" } } }
+    }))
+    .await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "kind": "docker" }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["then", "else"]);
+}
+
+#[tokio::test]
+async fn a_draft_4_root_still_decides_a_const_condition() {
+    let mut schema = conditional_schema();
+    schema["$schema"] = json!("http://json-schema.org/draft-04/schema#");
+    let (schemas, url) = seeded(schema).await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "kind": "podman" }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["else"]);
+}
+
+#[tokio::test]
+async fn branches_without_a_condition_are_inert() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "then": { "properties": { "image": { "description": "then" } } },
+        "else": { "properties": { "image": { "description": "else" } } }
+    }))
+    .await;
+
+    let keys = "image".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({}), &keys)
+        .await
+        .unwrap();
+
+    assert!(found.is_empty());
+}
+
+#[tokio::test]
+async fn the_schema_carrying_a_condition_is_still_collected() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": {
+            "server": {
+                "description": "carrier",
+                "if": { "properties": { "kind": { "const": "docker" } }, "required": ["kind"] },
+                "then": { "description": "then" }
+            }
+        }
+    }))
+    .await;
+
+    let keys = "server".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "server": { "kind": "docker" } }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["then", "carrier"]);
+}
+
+#[tokio::test]
+async fn completion_follows_the_branch_the_document_selects() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "if": { "properties": { "kind": { "const": "docker" } }, "required": ["kind"] },
+        "then": { "properties": { "image": { "type": "string" } } },
+        "else": { "properties": { "binary": { "type": "string" } } }
+    }))
+    .await;
+
+    let children = schemas
+        .possible_schemas_from(&url, &json!({ "kind": "docker" }), &Keys::empty(), 5)
+        .await
+        .unwrap();
+
+    let mut offered: Vec<String> = children
+        .iter()
+        .map(|(_, relative, _)| relative.to_string())
+        .filter(|key| !key.is_empty())
+        .collect();
+    offered.sort();
+
+    assert_eq!(offered, ["image"]);
+}
