@@ -1609,3 +1609,130 @@ async fn a_defs_container_beside_a_ref_is_not_a_sibling() {
 
     assert_eq!(descriptions(&found), ["the model"]);
 }
+
+/// Every shape in the spec's end-to-end table, asserted of both halves at once.
+/// A validation result of "no errors" is not acceptable: an unresolved
+/// reference produces exactly that, so the type error has to be present and
+/// the resolver errors absent.
+#[tokio::test]
+async fn traversal_and_validation_agree_on_every_reference_shape() {
+    let shapes: &[(&str, Value)] = &[
+        ("pointer", json!({ "$ref": "#/definitions/port" })),
+        ("defs-pointer", json!({ "$ref": "#/$defs/port" })),
+        (
+            "relative",
+            json!({ "$ref": "common.json#/definitions/port" }),
+        ),
+        (
+            "absolute",
+            json!({ "$ref": "file:///taplo-test/common.json#/definitions/port" }),
+        ),
+        ("anchor", json!({ "$ref": "#port" })),
+        ("rescoped", json!({ "$ref": "#/definitions/wrapper" })),
+    ];
+
+    for (name, reference) in shapes {
+        let (schemas, url) = seeded_documents(&[
+            (
+                "schema.json",
+                json!({
+                    "type": "object",
+                    "properties": { "port": reference },
+                    "definitions": {
+                        "port": { "description": name, "type": "integer" },
+                        "anchored": { "$id": "#port", "description": name, "type": "integer" },
+                        "wrapper": { "$id": "defs/", "$ref": "port.json" }
+                    },
+                    "$defs": { "port": { "description": name, "type": "integer" } }
+                }),
+            ),
+            (
+                "common.json",
+                json!({
+                    "definitions": { "port": { "description": name, "type": "integer" } }
+                }),
+            ),
+            (
+                "defs/port.json",
+                json!({ "description": name, "type": "integer" }),
+            ),
+        ])
+        .await;
+
+        let found = schemas
+            .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+            .await
+            .unwrap_or_else(|e| panic!("traversal failed for `{name}`: {e}"));
+
+        assert_eq!(descriptions(&found), [*name], "traversal, `{name}`");
+
+        let errors = schemas
+            .validate(&url, &json!({ "port": "not an integer" }))
+            .await
+            .unwrap_or_else(|e| panic!("validation failed for `{name}`: {e}"));
+
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e.kind, jsonschema::error::ValidationErrorKind::Type { .. })),
+            "validation, `{name}`: expected a type error, got {errors:?}"
+        );
+
+        assert!(
+            !errors.iter().any(|e| matches!(
+                e.kind,
+                jsonschema::error::ValidationErrorKind::Resolver { .. }
+                    | jsonschema::error::ValidationErrorKind::InvalidReference { .. }
+            )),
+            "validation, `{name}`: a reference did not resolve, {errors:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_relative_root_id_does_not_break_compilation() {
+    let (schemas, url) = seeded(json!({
+        "$id": "schema.json",
+        "type": "object",
+        "properties": { "port": { "type": "integer" } }
+    }))
+    .await;
+
+    let errors = schemas
+        .validate(&url, &json!({ "port": "not an integer" }))
+        .await
+        .expect("compilation failed for a relative root $id");
+
+    assert_eq!(errors.len(), 1);
+}
+
+#[tokio::test]
+async fn a_draft_4_root_resolves_a_relative_reference() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "type": "object",
+                "properties": { "port": { "$ref": "common.json#/definitions/port" } }
+            }),
+        ),
+        (
+            "common.json",
+            json!({ "definitions": { "port": { "type": "integer" } } }),
+        ),
+    ])
+    .await;
+
+    let errors = schemas
+        .validate(&url, &json!({ "port": "not an integer" }))
+        .await
+        .expect("validation errored for a draft-4 root");
+
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e.kind, jsonschema::error::ValidationErrorKind::Type { .. })),
+        "expected a type error, got {errors:?}"
+    );
+}

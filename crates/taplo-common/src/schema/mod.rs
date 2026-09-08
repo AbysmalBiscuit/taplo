@@ -240,7 +240,8 @@ impl<E: Environment> Schemas<E> {
         schema_url: Url,
         schema: &Value,
     ) -> Result<Arc<JSONSchema>, anyhow::Error> {
-        let v = Arc::new(self.create_validator(schema)?);
+        let scoped = scoped_to(&schema_url, schema);
+        let v = Arc::new(self.create_validator(scoped.as_ref().unwrap_or(schema))?);
         self.validators.lock().put(schema_url, v.clone());
         Ok(v)
     }
@@ -1279,6 +1280,38 @@ fn declared_draft(schema: &Value) -> DeclaredDraft {
         "/draft/2020-12/schema" => DeclaredDraft::Supported(Draft::Draft202012),
         _ => DeclaredDraft::Unsupported(normalized.to_owned()),
     }
+}
+
+/// A copy of `schema` whose root identifier is absolute against the URL it was
+/// loaded from, or `None` when it already is.
+///
+/// `jsonschema` takes its compilation scope from the root identifier alone and
+/// offers no way to set a base, so a schema without one resolves every relative
+/// reference against `json-schema:///` — a scheme nothing can fetch — and a
+/// schema with a relative one fails to compile at all. Both make the whole
+/// `validate` call error, which reaches the reader as a document with no
+/// diagnostics.
+///
+/// Draft 4 spells the keyword `id`, and that is the one `jsonschema` reads
+/// under that draft, so the draft decides which is written.
+fn scoped_to(schema_url: &Url, schema: &Value) -> Option<Value> {
+    let keyword = match declared_draft(schema) {
+        DeclaredDraft::Supported(Draft::Draft4) => "id",
+        _ => "$id",
+    };
+
+    let scope = match schema[keyword].as_str() {
+        Some(declared) if Url::parse(declared).is_ok() => return None,
+        Some(declared) => reference_url(schema_url, declared)?,
+        None => schema_url.clone(),
+    };
+
+    let mut scoped = schema.clone();
+    scoped
+        .as_object_mut()?
+        .insert(keyword.to_owned(), Value::String(scope.into()));
+
+    Some(scoped)
 }
 
 pub trait ValueExt {
