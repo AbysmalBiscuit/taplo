@@ -31,6 +31,14 @@ pub async fn links<E: Environment>(
 
     let mut links = Vec::new();
 
+    let document = match serde_json::to_value(&doc.dom) {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::warn!(%error, "cannot turn DOM into JSON");
+            return Ok(None);
+        }
+    };
+
     if let Some(schema_association) = ws
         .schemas
         .associations()
@@ -43,24 +51,16 @@ pub async fn links<E: Environment>(
             "using schema"
         );
 
-        for (keys, last_key, node) in doc.dom.flat_iter().filter_map(|(k, n)| {
+        for (keys, last_key) in doc.dom.flat_iter().filter_map(|(k, _)| {
             if let Some(KeyOrIndex::Key(last_key)) = k.iter().last().cloned() {
-                Some((k, last_key, n))
+                Some((k, last_key))
             } else {
                 None
             }
         }) {
-            let value = match serde_json::to_value(&node) {
-                Ok(v) => v,
-                Err(error) => {
-                    tracing::debug!(%error, "invalid TOML value");
-                    continue;
-                }
-            };
-
             let schemas = match ws
                 .schemas
-                .schemas_at_path(&schema_association.url, &value, &keys)
+                .schemas_at_path(&schema_association.url, &document, &keys)
                 .await
             {
                 Ok(s) => s,

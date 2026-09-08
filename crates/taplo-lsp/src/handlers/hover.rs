@@ -703,6 +703,19 @@ pub(crate) mod tests {
         source: &str,
         character: u32,
     ) -> Option<String> {
+        hover_at_line(schema, source, 0, character).await
+    }
+
+    /// Returns the markdown the hover handler produces at a position.
+    ///
+    /// A conditional schema needs the discriminator and the key it selects on
+    /// different lines, which is why the line is a parameter.
+    pub(crate) async fn hover_at_line(
+        schema: serde_json::Value,
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> Option<String> {
         let (world, document_url) = world_with(schema, source).await;
 
         let hovered = hover(
@@ -710,7 +723,7 @@ pub(crate) mod tests {
             Some(HoverParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri: document_url },
-                    position: LspPosition::new(0, character),
+                    position: LspPosition::new(line, character),
                 },
                 work_done_progress_params: Default::default(),
             })
@@ -731,6 +744,16 @@ pub(crate) mod tests {
         source: &str,
         character: u32,
     ) -> Vec<lsp_types::CompletionItem> {
+        complete_at_line(schema, source, 0, character).await
+    }
+
+    /// Returns the completion items the handler produces at a position.
+    pub(crate) async fn complete_at_line(
+        schema: serde_json::Value,
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> Vec<lsp_types::CompletionItem> {
         let (world, document_url) = world_with(schema, source).await;
 
         let response = crate::handlers::completion(
@@ -738,7 +761,7 @@ pub(crate) mod tests {
             Some(lsp_types::CompletionParams {
                 text_document_position: TextDocumentPositionParams {
                     text_document: TextDocumentIdentifier { uri: document_url },
-                    position: LspPosition::new(0, character),
+                    position: LspPosition::new(line, character),
                 },
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
@@ -753,6 +776,39 @@ pub(crate) mod tests {
             Some(lsp_types::CompletionResponse::Array(items)) => items,
             other => panic!("expected an array of completion items, got {other:?}"),
         }
+    }
+
+    /// Returns the document links the handler produces for a whole document.
+    ///
+    /// `schema.links` is off by default, and the handler returns nothing
+    /// without it.
+    pub(crate) async fn links_at(
+        schema: serde_json::Value,
+        source: &str,
+    ) -> Vec<lsp_types::DocumentLink> {
+        let (world, document_url) = world_with(schema, source).await;
+
+        {
+            let mut workspaces = world.workspaces.write().await;
+            workspaces
+                .by_document_mut(&document_url)
+                .config
+                .schema
+                .links = true;
+        }
+
+        crate::handlers::links(
+            lsp_async_stub::Context::detached(world),
+            Some(lsp_types::DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri: document_url },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .into(),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_default()
     }
 
     fn described(description: &str) -> serde_json::Value {
@@ -1466,5 +1522,53 @@ pub(crate) mod tests {
                 "- Properties: `>= 1`"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn hover_reads_the_branch_the_document_selects() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "kind": { "type": "string" } },
+            "if": { "properties": { "kind": { "const": "docker" } }, "required": ["kind"] },
+            "then": { "properties": { "image": { "description": "the image to pull" } } },
+            "else": { "properties": { "image": { "description": "the binary to run" } } }
+        });
+
+        let hovered = hover_at_line(schema, "kind = \"docker\"\nimage = \"nginx\"\n", 1, 1).await;
+
+        assert_eq!(hovered.as_deref(), Some("the image to pull"));
+    }
+
+    #[tokio::test]
+    async fn links_follow_the_branch_the_document_selects() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "object",
+                    "properties": { "kind": { "type": "string" } },
+                    "if": { "properties": { "kind": { "const": "docker" } }, "required": ["kind"] },
+                    "then": {
+                        "properties": {
+                            "image": { "x-taplo": { "links": { "key": "https://example.com/image" } } }
+                        }
+                    },
+                    "else": {
+                        "properties": {
+                            "image": { "x-taplo": { "links": { "key": "https://example.com/binary" } } }
+                        }
+                    }
+                }
+            }
+        });
+
+        let links = links_at(schema, "[server]\nkind = \"docker\"\nimage = \"nginx\"\n").await;
+
+        let targets: Vec<String> = links
+            .iter()
+            .filter_map(|link| link.target.as_ref().map(ToString::to_string))
+            .collect();
+
+        assert_eq!(targets, ["https://example.com/image"]);
     }
 }

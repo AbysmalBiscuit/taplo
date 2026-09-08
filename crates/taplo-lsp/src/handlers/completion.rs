@@ -838,7 +838,7 @@ fn empty_value_snippet(schema: &Value, cursor_count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::hover::tests::complete_at;
+    use super::super::hover::tests::{complete_at, complete_at_line};
     use lsp_types::CompletionItemTag;
     use serde_json::json;
 
@@ -988,5 +988,21 @@ mod tests {
 
         let keys = complete_at(schema, "\n", 0).await;
         assert_eq!(keys[0].insert_text.as_deref(), Some("port = ${0:{  }}"));
+    }
+
+    #[tokio::test]
+    async fn key_completion_offers_only_the_selected_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "kind": { "type": "string" } },
+            "if": { "properties": { "kind": { "const": "docker" } }, "required": ["kind"] },
+            "then": { "properties": { "image": { "type": "string" } } },
+            "else": { "properties": { "binary": { "type": "string" } } }
+        });
+
+        let items = complete_at_line(schema, "kind = \"docker\"\ni\n", 1, 1).await;
+
+        assert!(labels(&items).contains(&"image"));
+        assert!(!labels(&items).contains(&"binary"));
     }
 }
