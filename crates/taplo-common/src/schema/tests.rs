@@ -1210,3 +1210,93 @@ async fn defs_and_definitions_resolve_under_every_draft() {
         }
     }
 }
+
+#[tokio::test]
+async fn an_inner_id_rebases_the_references_beneath_it() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": { "port": { "$ref": "#/definitions/wrapper" } },
+                "definitions": {
+                    "wrapper": { "$id": "defs/", "$ref": "port.json" }
+                }
+            }),
+        ),
+        (
+            "defs/port.json",
+            json!({ "description": "rescoped", "type": "integer" }),
+        ),
+    ])
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["rescoped"]);
+}
+
+#[tokio::test]
+async fn a_reference_rebases_at_the_document_it_reaches() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": { "port": { "$ref": "sub/inner.json#/definitions/port" } }
+            }),
+        ),
+        (
+            "sub/inner.json",
+            json!({ "definitions": { "port": { "$ref": "port.json" } } }),
+        ),
+        (
+            "sub/port.json",
+            json!({ "description": "beside inner", "type": "integer" }),
+        ),
+    ])
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["beside inner"]);
+}
+
+/// A pointer collects an `$id` from every object it walks through, which is
+/// what `jsonschema`'s own `resolve_fragment` does through `join_folders`.
+#[tokio::test]
+async fn a_pointer_crossing_an_id_rebases_beneath_it() {
+    let (schemas, url) = seeded_documents(&[
+        (
+            "schema.json",
+            json!({
+                "type": "object",
+                "properties": { "port": { "$ref": "#/definitions/sub/properties/x" } },
+                "definitions": {
+                    "sub": {
+                        "$id": "sub/",
+                        "properties": { "x": { "$ref": "port.json" } }
+                    }
+                }
+            }),
+        ),
+        (
+            "sub/port.json",
+            json!({ "description": "under sub", "type": "integer" }),
+        ),
+    ])
+    .await;
+
+    let found = schemas
+        .schemas_at_path(&url, &Value::Null, &"port".parse::<Keys>().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["under sub"]);
+}

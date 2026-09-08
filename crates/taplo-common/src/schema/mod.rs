@@ -245,28 +245,33 @@ impl<E: Environment> Schemas<E> {
         Ok(v)
     }
 
-    #[async_recursion(?Send)]
+    /// The schema at `url`, with the base in force *around* it.
+    ///
+    /// A JSON pointer may cross objects that carry `$id`, each of which
+    /// re-bases what lies beneath it, so the base is the document's URL joined
+    /// with every `$id` the pointer walked *through*. The target's own `$id` is
+    /// deliberately not applied: every consumer re-bases on entry, and applying
+    /// it here as well would join it twice — `{"$id": "defs/"}` would resolve a
+    /// sibling reference against `defs/defs/`.
     #[must_use]
-    pub(crate) async fn resolve_schema(&self, url: Url) -> Result<Arc<Value>, anyhow::Error> {
-        let fragment = url.fragment().unwrap_or_default();
-
-        // An absent or empty fragment names the whole document; a fragment
-        // starting with `/` is a JSON pointer. A URI fragment is
-        // percent-encoded and a JSON pointer is not, so it is decoded before
-        // use; `~0` and `~1` survive that untouched and `serde_json` unescapes
-        // them itself.
-        if fragment.is_empty() {
-            let mut document_url = url.clone();
-            document_url.set_fragment(None);
-            let val = self.load_schema(&document_url).await?;
-            drop(self.cache.store(document_url, val.clone()));
-            return Ok(val);
-        }
-
+    pub(crate) async fn resolve_schema(
+        &self,
+        url: Url,
+    ) -> Result<(Url, Arc<Value>), anyhow::Error> {
         let mut document_url = url.clone();
         document_url.set_fragment(None);
-        let document = self.resolve_schema(document_url).await?;
 
+        let document = self.load_schema(&document_url).await?;
+        drop(self.cache.store(document_url.clone(), document.clone()));
+
+        let fragment = url.fragment().unwrap_or_default();
+        if fragment.is_empty() {
+            return Ok((document_url, document));
+        }
+
+        // A URI fragment is percent-encoded where a JSON pointer is not, so it
+        // is decoded before use. `~0` and `~1` survive that untouched and are
+        // unescaped per token below.
         let pointer = percent_encoding::percent_decode_str(fragment)
             .decode_utf8()
             .with_context(|| format!("reference fragment is not valid UTF-8: {fragment}"))?;
@@ -275,10 +280,28 @@ impl<E: Environment> Schemas<E> {
             return Err(anyhow!("could not resolve reference fragment `{pointer}`"));
         }
 
-        document
-            .pointer(&pointer)
-            .map(|v| Arc::new(v.clone()))
-            .ok_or_else(|| anyhow!("failed to resolve reference `{url}`"))
+        let mut base = document_url;
+        let mut target = &*document;
+
+        for token in pointer.split('/').skip(1) {
+            // The `$id` of an object the pointer passes *through* re-bases what
+            // lies below it. The one on the object the pointer lands on is left
+            // to the traversal, which re-bases on entry.
+            if let Some(rebased) = rebase(&base, target) {
+                base = rebased;
+            }
+
+            let token = token.replace("~1", "/").replace("~0", "~");
+
+            target = match target {
+                Value::Object(map) => map.get(&token),
+                Value::Array(items) => token.parse::<usize>().ok().and_then(|i| items.get(i)),
+                _ => None,
+            }
+            .ok_or_else(|| anyhow!("failed to resolve reference `{url}`"))?;
+        }
+
+        Ok((base, Arc::new(target.clone())))
     }
 
     fn create_validator(&self, schema: &Value) -> Result<JSONSchema, anyhow::Error> {
@@ -384,7 +407,7 @@ impl<E: Environment> Schemas<E> {
     /// draft-4 root needs, since draft 4 has no `const` to discriminate on.
     async fn condition_holds(
         &self,
-        root_url: &Url,
+        base_url: &Url,
         condition: &Value,
         instance: &Value,
     ) -> Option<bool> {
@@ -392,8 +415,10 @@ impl<E: Environment> Schemas<E> {
             return None;
         }
 
-        let resolved = self.ref_schema_value(root_url, condition).await;
-        let condition = resolved.as_ref().map_or(condition, |(_, schema)| &**schema);
+        let resolved = self.ref_schema_value(base_url, condition).await;
+        let condition = resolved
+            .as_ref()
+            .map_or(condition, |(_, _, schema)| &**schema);
 
         if names_a_ref(condition) {
             return None;
@@ -417,7 +442,7 @@ impl<E: Environment> Schemas<E> {
     /// offers for `oneOf` and `anyOf`.
     async fn conditional_subschemas<'s>(
         &self,
-        root_url: &Url,
+        base_url: &Url,
         schema: &'s Value,
         instance: &Value,
     ) -> Vec<&'s Value> {
@@ -427,7 +452,7 @@ impl<E: Environment> Schemas<E> {
 
         if !schema["if"].is_null() && branches.iter().any(|branch| !branch.is_null()) {
             let selected: &[&Value] = match self
-                .condition_holds(root_url, &schema["if"], instance)
+                .condition_holds(base_url, &schema["if"], instance)
                 .await
             {
                 Some(true) => &branches[..1],
@@ -468,7 +493,7 @@ impl<E: Environment> Schemas<E> {
     #[allow(clippy::too_many_arguments)]
     async fn collect_schemas(
         &self,
-        root_url: &Url,
+        base_url: &Url,
         schema: &Value,
         value: &Value,
         full_path: Keys,
@@ -483,8 +508,11 @@ impl<E: Environment> Schemas<E> {
 
         let composition_depth = composition_depth - 1;
 
+        let rebased = rebase(base_url, schema);
+        let base_url = rebased.as_ref().unwrap_or(base_url);
+
         if let Some(r) = schema.schema_ref() {
-            let url = reference_url(root_url, r)
+            let url = reference_url(base_url, r)
                 .ok_or_else(|| anyhow!("could not determine schema URL"))?;
 
             // A reference already followed on this chain leads back to a schema
@@ -494,12 +522,12 @@ impl<E: Environment> Schemas<E> {
                 return Ok(false);
             }
 
-            let schema = self.resolve_schema(url.clone()).await?;
+            let (target_base, schema) = self.resolve_schema(url.clone()).await?;
 
             visited.push(url);
             let evaluated = self
                 .collect_schemas(
-                    root_url,
+                    &target_base,
                     &schema,
                     value,
                     full_path.clone(),
@@ -520,7 +548,7 @@ impl<E: Environment> Schemas<E> {
             for one_of in one_ofs {
                 evaluated |= self
                     .collect_schemas(
-                        root_url,
+                        base_url,
                         one_of,
                         value,
                         full_path.clone(),
@@ -537,7 +565,7 @@ impl<E: Environment> Schemas<E> {
             for any_of in any_ofs {
                 evaluated |= self
                     .collect_schemas(
-                        root_url,
+                        base_url,
                         any_of,
                         value,
                         full_path.clone(),
@@ -554,7 +582,7 @@ impl<E: Environment> Schemas<E> {
             for all_of in all_ofs {
                 evaluated |= self
                     .collect_schemas(
-                        root_url,
+                        base_url,
                         all_of,
                         value,
                         full_path.clone(),
@@ -567,10 +595,10 @@ impl<E: Environment> Schemas<E> {
             }
         }
 
-        for conditional in self.conditional_subschemas(root_url, schema, value).await {
+        for conditional in self.conditional_subschemas(base_url, schema, value).await {
             evaluated |= self
                 .collect_schemas(
-                    root_url,
+                    base_url,
                     conditional,
                     value,
                     full_path.clone(),
@@ -598,7 +626,7 @@ impl<E: Environment> Schemas<E> {
                 // For array of tables.
                 let _ = self
                     .collect_schemas(
-                        root_url,
+                        base_url,
                         &schema["items"][k.value()],
                         &value[k.value()],
                         full_path.join(k.clone()),
@@ -611,7 +639,7 @@ impl<E: Environment> Schemas<E> {
 
                 let _ = self
                     .collect_schemas(
-                        root_url,
+                        base_url,
                         &schema["properties"][k.value()],
                         &value[k.value()],
                         full_path.join(k.clone()),
@@ -625,7 +653,7 @@ impl<E: Environment> Schemas<E> {
 
                 let _ = self
                     .collect_schemas(
-                        root_url,
+                        base_url,
                         &schema["additionalProperties"],
                         &value[k.value()],
                         full_path.join(k.clone()),
@@ -643,7 +671,7 @@ impl<E: Environment> Schemas<E> {
                             if re.is_match(k.value()) {
                                 let _ = self
                                     .collect_schemas(
-                                        root_url,
+                                        base_url,
                                         pattern_schema,
                                         &value[k.value()],
                                         full_path.join(k.clone()),
@@ -665,7 +693,7 @@ impl<E: Environment> Schemas<E> {
                 if !evaluated {
                     let _ = self
                         .collect_schemas(
-                            root_url,
+                            base_url,
                             &schema["unevaluatedProperties"],
                             &value[k.value()],
                             full_path.join(k.clone()),
@@ -694,7 +722,7 @@ impl<E: Environment> Schemas<E> {
 
                 let _ = self
                     .collect_schemas(
-                        root_url,
+                        base_url,
                         item_schema,
                         &value[idx],
                         full_path.join(*idx),
@@ -750,7 +778,7 @@ impl<E: Environment> Schemas<E> {
     #[allow(clippy::too_many_arguments)]
     async fn collect_child_schemas(
         &self,
-        root_url: &Url,
+        base_url: &Url,
         schema: &Value,
         root_path: &Keys,
         path: &Keys,
@@ -766,14 +794,17 @@ impl<E: Environment> Schemas<E> {
 
         let composition_depth = composition_depth - 1;
 
-        if let Some((url, resolved)) = self.ref_schema_value(root_url, schema).await {
+        let rebased = rebase(base_url, schema);
+        let base_url = rebased.as_ref().unwrap_or(base_url);
+
+        if let Some((url, target_base, resolved)) = self.ref_schema_value(base_url, schema).await {
             if visited.contains(&url) {
                 return;
             }
 
             visited.push(url);
             self.collect_child_schemas(
-                root_url,
+                &target_base,
                 &resolved,
                 root_path,
                 path,
@@ -792,7 +823,7 @@ impl<E: Environment> Schemas<E> {
         if let Some(one_ofs) = schema["oneOf"].as_array() {
             for one_of in one_ofs {
                 self.collect_child_schemas(
-                    root_url,
+                    base_url,
                     one_of,
                     root_path,
                     path,
@@ -809,7 +840,7 @@ impl<E: Environment> Schemas<E> {
         if let Some(any_ofs) = schema["anyOf"].as_array() {
             for any_of in any_ofs {
                 self.collect_child_schemas(
-                    root_url,
+                    base_url,
                     any_of,
                     root_path,
                     path,
@@ -824,11 +855,11 @@ impl<E: Environment> Schemas<E> {
         }
 
         for conditional in self
-            .conditional_subschemas(root_url, schema, instance)
+            .conditional_subschemas(base_url, schema, instance)
             .await
         {
             self.collect_child_schemas(
-                root_url,
+                base_url,
                 conditional,
                 root_path,
                 path,
@@ -865,8 +896,8 @@ impl<E: Environment> Schemas<E> {
                 let mut merged_urls = Vec::new();
 
                 for all_of in all_ofs {
-                    match self.ref_schema_value(root_url, all_of).await {
-                        Some((url, resolved)) => {
+                    match self.ref_schema_value(base_url, all_of).await {
+                        Some((url, _, resolved)) => {
                             if visited.contains(&url) || merged_urls.contains(&url) {
                                 continue;
                             }
@@ -883,7 +914,7 @@ impl<E: Environment> Schemas<E> {
                 visited.append(&mut merged_urls);
 
                 self.collect_child_schemas(
-                    root_url,
+                    base_url,
                     &merged_all_of,
                     root_path,
                     path,
@@ -915,7 +946,7 @@ impl<E: Environment> Schemas<E> {
         if let Some(map) = schema["properties"].as_object() {
             for (k, v) in map {
                 self.collect_child_schemas(
-                    root_url,
+                    base_url,
                     v,
                     root_path,
                     &path.join(Key::from(k)),
@@ -930,14 +961,19 @@ impl<E: Environment> Schemas<E> {
         }
     }
 
-    /// The schema a `$ref` names, with the URL it resolved to.
+    /// The schema a `$ref` names, with the URL it resolved to and the base in
+    /// force around it.
     ///
     /// The URL is what the visited set is keyed on, so it has to travel with
     /// the value rather than be recomputed by the caller.
-    async fn ref_schema_value(&self, root_url: &Url, schema: &Value) -> Option<(Url, Arc<Value>)> {
+    async fn ref_schema_value(
+        &self,
+        base_url: &Url,
+        schema: &Value,
+    ) -> Option<(Url, Url, Arc<Value>)> {
         let r = schema.schema_ref()?;
 
-        let url = match reference_url(root_url, r) {
+        let url = match reference_url(base_url, r) {
             Some(u) => u,
             None => {
                 tracing::error!(reference = r, "could not determine schema URL");
@@ -946,7 +982,7 @@ impl<E: Environment> Schemas<E> {
         };
 
         match self.resolve_schema(url.clone()).await {
-            Ok(s) => Some((url, s)),
+            Ok((target_base, s)) => Some((url, target_base, s)),
             Err(error) => {
                 tracing::error!(?error, "failed to resolve schema");
                 None
@@ -970,6 +1006,21 @@ fn instance_at<'v>(value: &'v Value, keys: &Keys) -> &'v Value {
     }
 
     instance
+}
+
+/// The base a schema object establishes for everything written inside it.
+///
+/// `$id` is a URI reference like any other, resolved against the base in force
+/// where it appears; its fragment names the object rather than a document, so
+/// it is dropped from the base. Draft 4 spells this keyword `id`, which
+/// traversal does not read: `id` stopped being a keyword in draft 6, and a
+/// schema still carrying one as leftover metadata would otherwise re-base
+/// every reference beneath it.
+fn rebase(base: &Url, schema: &Value) -> Option<Url> {
+    let id = schema["$id"].as_str()?;
+    let mut url = base.join(id).ok()?;
+    url.set_fragment(None);
+    Some(url)
 }
 
 /// Whether a subschema names a reference anywhere within it.
