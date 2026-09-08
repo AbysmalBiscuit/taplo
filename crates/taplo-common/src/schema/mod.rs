@@ -339,16 +339,17 @@ impl<E: Environment> Schemas<E> {
     ) -> Result<Vec<(Keys, Arc<Value>)>, anyhow::Error> {
         let mut schemas = Vec::new();
         let schema = self.load_schema(schema_url).await?;
-        self.collect_schemas(
-            schema_url,
-            &schema,
-            value,
-            Keys::empty(),
-            path,
-            MAX_COMPOSITION_DEPTH,
-            &mut schemas,
-        )
-        .await?;
+        let _evaluated = self
+            .collect_schemas(
+                schema_url,
+                &schema,
+                value,
+                Keys::empty(),
+                path,
+                MAX_COMPOSITION_DEPTH,
+                &mut schemas,
+            )
+            .await?;
 
         schemas = schemas
             .into_iter()
@@ -459,9 +460,9 @@ impl<E: Environment> Schemas<E> {
         path: &Keys,
         composition_depth: usize,
         schemas: &mut Vec<(Keys, Arc<Value>)>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<bool, anyhow::Error> {
         if !schema.is_object() || composition_depth == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let composition_depth = composition_depth - 1;
@@ -483,41 +484,61 @@ impl<E: Environment> Schemas<E> {
                 .await;
         }
 
+        let mut evaluated = false;
+
         if let Some(one_ofs) = schema["oneOf"].as_array() {
             for one_of in one_ofs {
-                self.collect_schemas(
-                    root_url,
-                    one_of,
-                    value,
-                    full_path.clone(),
-                    path,
-                    composition_depth,
-                    schemas,
-                )
-                .await?;
+                evaluated |= self
+                    .collect_schemas(
+                        root_url,
+                        one_of,
+                        value,
+                        full_path.clone(),
+                        path,
+                        composition_depth,
+                        schemas,
+                    )
+                    .await?;
             }
         }
 
         if let Some(any_ofs) = schema["anyOf"].as_array() {
             for any_of in any_ofs {
-                self.collect_schemas(
-                    root_url,
-                    any_of,
-                    value,
-                    full_path.clone(),
-                    path,
-                    composition_depth,
-                    schemas,
-                )
-                .await?;
+                evaluated |= self
+                    .collect_schemas(
+                        root_url,
+                        any_of,
+                        value,
+                        full_path.clone(),
+                        path,
+                        composition_depth,
+                        schemas,
+                    )
+                    .await?;
             }
         }
 
         if let Some(all_ofs) = schema["allOf"].as_array() {
             for all_of in all_ofs {
-                self.collect_schemas(
+                evaluated |= self
+                    .collect_schemas(
+                        root_url,
+                        all_of,
+                        value,
+                        full_path.clone(),
+                        path,
+                        composition_depth,
+                        schemas,
+                    )
+                    .await?;
+            }
+        }
+
+        for conditional in self.conditional_subschemas(root_url, schema, value).await {
+            evaluated |= self
+                .collect_schemas(
                     root_url,
-                    all_of,
+                    conditional,
                     value,
                     full_path.clone(),
                     path,
@@ -525,20 +546,6 @@ impl<E: Environment> Schemas<E> {
                     schemas,
                 )
                 .await?;
-            }
-        }
-
-        for conditional in self.conditional_subschemas(root_url, schema, value).await {
-            self.collect_schemas(
-                root_url,
-                conditional,
-                value,
-                full_path.clone(),
-                path,
-                composition_depth,
-                schemas,
-            )
-            .await?;
         }
 
         let include_self = schema["allOf"].is_null();
@@ -547,7 +554,7 @@ impl<E: Environment> Schemas<E> {
             if include_self {
                 schemas.push((full_path.clone(), Arc::new(schema.clone())));
             }
-            return Ok(());
+            return Ok(false);
         };
 
         let child_path = path.skip_left(1);
@@ -555,56 +562,80 @@ impl<E: Environment> Schemas<E> {
         match key {
             KeyOrIndex::Key(k) => {
                 // For array of tables.
-                self.collect_schemas(
-                    root_url,
-                    &schema["items"][k.value()],
-                    &value[k.value()],
-                    full_path.join(k.clone()),
-                    &child_path,
-                    MAX_COMPOSITION_DEPTH,
-                    schemas,
-                )
-                .await?;
+                let _ = self
+                    .collect_schemas(
+                        root_url,
+                        &schema["items"][k.value()],
+                        &value[k.value()],
+                        full_path.join(k.clone()),
+                        &child_path,
+                        MAX_COMPOSITION_DEPTH,
+                        schemas,
+                    )
+                    .await?;
 
-                self.collect_schemas(
-                    root_url,
-                    &schema["properties"][k.value()],
-                    &value[k.value()],
-                    full_path.join(k.clone()),
-                    &child_path,
-                    MAX_COMPOSITION_DEPTH,
-                    schemas,
-                )
-                .await?;
+                let _ = self
+                    .collect_schemas(
+                        root_url,
+                        &schema["properties"][k.value()],
+                        &value[k.value()],
+                        full_path.join(k.clone()),
+                        &child_path,
+                        MAX_COMPOSITION_DEPTH,
+                        schemas,
+                    )
+                    .await?;
+                evaluated |= !schema["properties"][k.value()].is_null();
 
-                self.collect_schemas(
-                    root_url,
-                    &schema["additionalProperties"],
-                    &value[k.value()],
-                    full_path.join(k.clone()),
-                    &child_path,
-                    MAX_COMPOSITION_DEPTH,
-                    schemas,
-                )
-                .await?;
+                let _ = self
+                    .collect_schemas(
+                        root_url,
+                        &schema["additionalProperties"],
+                        &value[k.value()],
+                        full_path.join(k.clone()),
+                        &child_path,
+                        MAX_COMPOSITION_DEPTH,
+                        schemas,
+                    )
+                    .await?;
+                evaluated |= !schema["additionalProperties"].is_null();
 
                 if let Some(pattern_props) = schema["patternProperties"].as_object() {
                     for (pattern, pattern_schema) in pattern_props {
                         if let Ok(re) = Regex::new(pattern) {
                             if re.is_match(k.value()) {
-                                self.collect_schemas(
-                                    root_url,
-                                    pattern_schema,
-                                    &value[k.value()],
-                                    full_path.join(k.clone()),
-                                    &child_path,
-                                    MAX_COMPOSITION_DEPTH,
-                                    schemas,
-                                )
-                                .await?;
+                                let _ = self
+                                    .collect_schemas(
+                                        root_url,
+                                        pattern_schema,
+                                        &value[k.value()],
+                                        full_path.join(k.clone()),
+                                        &child_path,
+                                        MAX_COMPOSITION_DEPTH,
+                                        schemas,
+                                    )
+                                    .await?;
+                                evaluated = true;
                             }
                         }
                     }
+                }
+
+                // `unevaluatedProperties` applies to a key no other applicator
+                // in this schema evaluated, which is the question every
+                // in-place recursion above has just answered for this key.
+                if !evaluated {
+                    let _ = self
+                        .collect_schemas(
+                            root_url,
+                            &schema["unevaluatedProperties"],
+                            &value[k.value()],
+                            full_path.join(k.clone()),
+                            &child_path,
+                            MAX_COMPOSITION_DEPTH,
+                            schemas,
+                        )
+                        .await?;
                 }
             }
             KeyOrIndex::Index(idx) => {
@@ -622,20 +653,21 @@ impl<E: Environment> Schemas<E> {
                     &schema["items"]
                 };
 
-                self.collect_schemas(
-                    root_url,
-                    item_schema,
-                    &value[idx],
-                    full_path.join(*idx),
-                    &child_path,
-                    MAX_COMPOSITION_DEPTH,
-                    schemas,
-                )
-                .await?;
+                let _ = self
+                    .collect_schemas(
+                        root_url,
+                        item_schema,
+                        &value[idx],
+                        full_path.join(*idx),
+                        &child_path,
+                        MAX_COMPOSITION_DEPTH,
+                        schemas,
+                    )
+                    .await?;
             }
         }
 
-        Ok(())
+        Ok(evaluated)
     }
 
     #[tracing::instrument(skip_all, fields(%schema_url, %path))]

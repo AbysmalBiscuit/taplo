@@ -691,3 +691,120 @@ async fn the_array_form_of_dependencies_applies_nothing() {
         assert!(found.is_empty(), "keyword {keyword}");
     }
 }
+
+#[tokio::test]
+async fn an_unevaluated_key_falls_back_to_unevaluated_properties() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": { "known": { "description": "known" } },
+        "unevaluatedProperties": { "description": "unevaluated" }
+    }))
+    .await;
+
+    let keys = "other".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "other": 1 }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["unevaluated"]);
+}
+
+#[tokio::test]
+async fn an_evaluated_key_does_not_fall_back() {
+    let cases = [
+        json!({ "properties": { "known": { "description": "known" } } }),
+        json!({ "patternProperties": { "^kn": { "description": "known" } } }),
+        json!({ "additionalProperties": { "description": "known" } }),
+        json!({ "allOf": [{ "properties": { "known": { "description": "known" } } }] }),
+        json!({ "oneOf": [{ "properties": { "known": { "description": "known" } } }] }),
+        json!({ "anyOf": [{ "properties": { "known": { "description": "known" } } }] }),
+        json!({
+            "if": { "properties": { "kind": { "const": "a" } }, "required": ["kind"] },
+            "then": { "properties": { "known": { "description": "known" } } }
+        }),
+        json!({
+            "dependentSchemas": {
+                "kind": { "properties": { "known": { "description": "known" } } }
+            }
+        }),
+    ];
+
+    for case in cases {
+        let mut schema = case.clone();
+        schema["type"] = json!("object");
+        schema["unevaluatedProperties"] = json!({ "description": "unevaluated" });
+
+        let (schemas, url) = seeded(schema).await;
+
+        let keys = "known".parse::<Keys>().unwrap();
+        let found = schemas
+            .schemas_at_path(&url, &json!({ "kind": "a", "known": 1 }), &keys)
+            .await
+            .unwrap();
+
+        assert_eq!(descriptions(&found), ["known"], "case {case}");
+    }
+}
+
+#[tokio::test]
+async fn a_key_only_the_unselected_branch_evaluates_falls_back() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "if": { "properties": { "kind": { "const": "a" } }, "required": ["kind"] },
+        "then": { "properties": { "other": { "description": "then" } } },
+        "unevaluatedProperties": { "description": "unevaluated" }
+    }))
+    .await;
+
+    let keys = "other".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "kind": "b", "other": 1 }), &keys)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptions(&found), ["unevaluated"]);
+}
+
+#[tokio::test]
+async fn a_deep_path_asks_about_its_head_key() {
+    let cases = [
+        json!({ "allOf": [{ "properties": { "a": { "type": "object" } } }] }),
+        json!({ "additionalProperties": false }),
+    ];
+
+    for case in cases {
+        let mut schema = case.clone();
+        schema["type"] = json!("object");
+        schema["unevaluatedProperties"] =
+            json!({ "properties": { "b": { "description": "unevaluated" } } });
+
+        let (schemas, url) = seeded(schema).await;
+
+        let keys = "a.b".parse::<Keys>().unwrap();
+        let found = schemas
+            .schemas_at_path(&url, &json!({ "a": { "b": 1 } }), &keys)
+            .await
+            .unwrap();
+
+        assert!(found.is_empty(), "case {case}");
+    }
+}
+
+#[tokio::test]
+async fn a_boolean_unevaluated_properties_yields_nothing() {
+    let (schemas, url) = seeded(json!({
+        "type": "object",
+        "properties": { "known": { "description": "known" } },
+        "unevaluatedProperties": false
+    }))
+    .await;
+
+    let keys = "other".parse::<Keys>().unwrap();
+    let found = schemas
+        .schemas_at_path(&url, &json!({ "other": 1 }), &keys)
+        .await
+        .unwrap();
+
+    assert!(found.is_empty());
+}
