@@ -143,9 +143,13 @@ Task 1's detection must run against the pre-clamp tree, which it does: `node` is
 
 - [ ] **Step 3: Update the CLI tests that assumed 1.1**
 
-`crates/taplo-cli/tests/multiline_inline_tables.rs` exercises the multi-line inline table feature through the CLI. Every test whose *input* has no multi-line inline table but whose *expected output* does now resolves to 1.0 and fails. Run the suite, and for each failure add `"toml_version=1.1"` to that test's options array — the test is asserting 1.1 behavior and should say so. `expands_long_inline_tables` and `preserves_single_line_tables_when_expansion_is_disabled` are the expected candidates; run the suite rather than trusting that list.
+`crates/taplo-cli/tests/multiline_inline_tables.rs` exercises the multi-line inline table feature through the CLI. Every test whose *input* has no multi-line inline table but whose *expected output* does now resolves to 1.0 and fails. Run the suite, and for each failure add `"toml_version=1.1"` to that test's options array — the test is asserting 1.1 behavior and should say so.
+
+Reading the suite, `expands_long_inline_tables` is the only test that meets that description: its input is a single-line table and its expected output is multi-line. Every other test in the file feeds an input that already contains a newline between braces, so detection resolves 1.1 and they are unaffected. Run the suite rather than trusting that reading, but if a second test fails, understand why before touching it.
 
 Do not change any expected output string to match new behavior. If a test fails for a reason other than the version default, stop and report it: that is a real regression, not a test that needs updating.
+
+The `assert_format` helper at the top of that file also asserts idempotency — `format(format(x)) == format(x)` — and DOM equality against the input. The gate must not break either. It does not, because detection reads the document being formatted: 1.0 output contains no multi-line inline table and re-resolves to 1.0, and 1.1 output contains one and re-resolves to 1.1. Keep that property; a design that resolved the version from anything other than the input document would lose it.
 
 **Verify:** `cargo test -p taplo-cli --test multiline_inline_tables` → PASS.
 
