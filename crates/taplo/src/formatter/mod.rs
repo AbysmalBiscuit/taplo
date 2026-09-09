@@ -221,6 +221,9 @@ struct Context {
     force_multiline: bool,
     errors: Rc<[TextRange]>,
     scopes: Rc<ScopedOptions>,
+    /// The version the document is formatted against, set once the root node
+    /// is known and used to clamp scoped options back to it.
+    version: ResolvedVersion,
 }
 
 impl Default for Context {
@@ -230,6 +233,7 @@ impl Default for Context {
             force_multiline: Default::default(),
             errors: Rc::from([]),
             scopes: Default::default(),
+            version: ResolvedVersion::V1_1,
         }
     }
 }
@@ -242,6 +246,8 @@ impl Context {
                 opts.update(s.clone());
             }
         }
+
+        clamp_to_version(opts, self.version);
     }
 
     fn error_at(&self, range: TextRange) -> bool {
@@ -365,16 +371,26 @@ where
     Ok(s)
 }
 
-fn format_impl(node: SyntaxNode, options: Options, context: Context) -> String {
-    assert!(node.kind() == ROOT);
-
-    // A newline between an inline table's braces is TOML 1.1 syntax, so
-    // targeting 1.0 means the formatter must never produce one.
-    let mut options = options;
-    if resolve_version(&node, options.toml_version) == ResolvedVersion::V1_0 {
+/// A newline between an inline table's braces is TOML 1.1 syntax, so
+/// targeting 1.0 means the formatter must never produce one.
+///
+/// Scoped options are layered on top of the document-wide options, so this
+/// runs again after every scope update: the target version is a property of
+/// the document and a per-key rule cannot opt out of it.
+fn clamp_to_version(options: &mut Options, version: ResolvedVersion) {
+    if version == ResolvedVersion::V1_0 {
         options.inline_table_expand = false;
         options.inline_table_auto_collapse = true;
     }
+}
+
+fn format_impl(node: SyntaxNode, options: Options, context: Context) -> String {
+    assert!(node.kind() == ROOT);
+
+    let mut options = options;
+    let mut context = context;
+    context.version = resolve_version(&node, options.toml_version);
+    clamp_to_version(&mut options, context.version);
 
     let mut formatted = format_root(node, &options, &context);
 

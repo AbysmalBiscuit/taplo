@@ -1281,3 +1281,48 @@ fn an_already_multiline_document_keeps_expanding() {
 
     assert_format!(expected, &formatted);
 }
+
+#[test]
+fn a_scoped_rule_cannot_expand_under_toml_1_0() {
+    let src = "long_it = { name = \"something\", description = \"a fairly long description here\", enabled = true, retries = 5 }\n";
+
+    let dom = crate::parser::parse(src).into_dom();
+    let scopes = [(
+        "long_it",
+        OptionsIncomplete {
+            inline_table_expand: Some(true),
+            ..Default::default()
+        },
+    )];
+    let formatted =
+        crate::formatter::format_with_path_scopes(dom, Options::default(), &[], scopes).unwrap();
+
+    assert_format!(src, &formatted);
+}
+
+#[test]
+fn a_scoped_rule_cannot_keep_multiline_under_toml_1_0() {
+    let src = "dependency = {\nversion = \"1\", optional = true,\n}\n";
+    let expected = "dependency = { version = \"1\", optional = true }\n";
+
+    let dom = crate::parser::parse(src).into_dom();
+    let scopes = [(
+        "dependency",
+        OptionsIncomplete {
+            inline_table_auto_collapse: Some(false),
+            ..Default::default()
+        },
+    )];
+    let formatted = crate::formatter::format_with_path_scopes(
+        dom,
+        Options {
+            toml_version: formatter::TomlVersion::V1_0,
+            ..Default::default()
+        },
+        &[],
+        scopes,
+    )
+    .unwrap();
+
+    assert_format!(expected, &formatted);
+}
