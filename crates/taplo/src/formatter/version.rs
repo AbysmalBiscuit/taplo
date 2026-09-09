@@ -108,6 +108,12 @@ fn directive_version(root: &SyntaxNode) -> Option<ResolvedVersion> {
     None
 }
 
+/// Parses a `#:name value` directive comment.
+///
+/// This duplicates `dom::Comment`'s directive parsing on purpose: the
+/// formatter holds a syntax tree, and building a DOM for every format call
+/// to read a single comment costs more than the duplicated split. The two
+/// parsers must stay in agreement about what a directive looks like.
 fn parse_directive(text: &str) -> Option<ResolvedVersion> {
     let directive_content = text.strip_prefix("#:")?;
     let mut parts = directive_content.split_whitespace();
