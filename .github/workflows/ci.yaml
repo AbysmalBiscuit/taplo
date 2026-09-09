@@ -3,9 +3,7 @@ name: Continuous integration
 on:
   push:
     branches:
-      - master
-    tags:
-      - release-*
+      - main
     paths-ignore:
       - "site/**/*"
       - schemas/**/*
@@ -13,33 +11,9 @@ on:
   workflow_dispatch: {}
   pull_request:
     branches:
-      - master
+      - main
 
 jobs:
-  auto_tag:
-    name: Tag Releases
-    if: (github.event_name == 'push' && github.ref_type == 'branch') || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.WORKFLOW_PAT }}
-          fetch-depth: 0
-      - uses: tamasfe/auto-tag@v5
-        with:
-          name: tamasfe
-          email: me@tamasfe.dev
-          token: ${{ secrets.WORKFLOW_PAT }}
-
-  fmt:
-    name: Check formatting
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker://docker.io/tamasfe/taplo:latest
-        with:
-          args: fmt --check --diff
-
   test:
     name: Test on Rust stable
     runs-on: ubuntu-latest
