@@ -76,7 +76,9 @@ What detection is good for is a floor: the formatter must not introduce syntax t
 
 **R7. A comment outranks the version.** An inline table containing a comment cannot be collapsed without dropping the comment, so under 1.0 it is left as found. The formatter never discards a comment to satisfy a version. This is the one exception to R6 and the invariant test states it.
 
-**R8. An unparseable version is inert.** `#:toml-version 2.0`, `#:toml-version banana`, or a malformed configured value leaves resolution where it would have been without it. Formatting never fails because a version could not be read.
+**R8. An unparseable directive is inert.** `#:toml-version 2.0` and `#:toml-version banana` leave resolution where it would have been without them. Formatting never fails because a directive could not be read: a directive is content inside someone's document, and a formatter that refuses to run over a comment it does not recognize is a formatter people stop running.
+
+A configured value is not a directive and does not get this treatment. `toml_version` reaches the formatter through the same two paths as every other option, `update_from_str` for the CLI's `--option` and serde for `.taplo.toml`, and both reject an unknown value exactly as they reject `column_width=banana`. Rejecting a misconfigured option is the existing contract; making this one option silently ignore what the user typed would be worse than the error.
 
 ## Resolution order
 
