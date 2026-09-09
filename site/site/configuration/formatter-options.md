@@ -33,6 +33,7 @@ In some environments (e.g., Visual Studio Code), one needs to reload the extensi
 | reorder_inline_tables |                       Alphabetically reorder inline table entries within groups separated by comments or blank lines.                       |     false      |
 |  allowed_blank_lines  |                                     The maximum amount of consecutive blank lines allowed.                                     |       2        |
 |         crlf          |                                                     Use CRLF line endings.                                                     |     false      |
+|      toml_version      |                    The TOML version the formatter targets: `auto`, `1.0`, or `1.1`. See below for what each targets.                    |     auto       |
 
 Multiline inline tables use TOML 1.1 syntax. To keep their multiline layout even when the entries fit on one line, set:
 
@@ -42,3 +43,5 @@ inline_table_auto_collapse = false
 ```
 
 Comments inside inline tables are preserved. Trailing comments move with their entries when `reorder_inline_tables` is enabled.
+
+`toml_version` picks which TOML version the formatter's output must parse as. Targeting `1.0` suppresses the multi-line inline table: `inline_table_expand` no longer expands an entry that is too wide for `column_width`, and `inline_table_auto_collapse` is forced on, overriding a configured `false`, so no inline table is left multi-line. An inline table that contains a comment is the one exception, it is left multi-line regardless, because collapsing it would drop the comment. Targeting `1.1` allows multi-line inline tables as normal. The version used to format a document is resolved in this order, highest priority first: a `#:toml-version` directive at the top of the document (see [Directives](./directives.md)), the configured `toml_version` when it is not `auto`, detection of an existing multi-line inline table in the document, and finally `1.0`. The default, `auto`, means the formatter never introduces a multi-line inline table into a document that did not already have one.

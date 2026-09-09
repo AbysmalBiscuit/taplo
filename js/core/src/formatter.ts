@@ -34,6 +34,12 @@ export interface FormatterOptions {
    */
   inlineTableTrailingComma?: boolean;
   /**
+   * The TOML version the formatter targets. Defaults to "auto", which
+   * targets 1.0 unless the document already contains a multi-line inline
+   * table.
+   */
+  tomlVersion?: "auto" | "1.0" | "1.1";
+  /**
    * Collapse arrays that don't exceed the maximum column width and don't contain comments.
    */
   arrayAutoCollapse?: boolean;
