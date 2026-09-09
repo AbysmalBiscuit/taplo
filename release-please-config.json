@@ -9,7 +9,7 @@
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
         { "type": "toml", "path": "crates/taplo-cli/Cargo.toml", "jsonpath": "$.package.version" },
-        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name=='taplo-cli')].version" }
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(@.name.value=='taplo-cli')].version" }
       ]
     }
   }
