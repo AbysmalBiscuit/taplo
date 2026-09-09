@@ -27,6 +27,7 @@ use schemars::JsonSchema;
 mod macros;
 mod version;
 
+use version::resolve_version;
 pub use version::{ResolvedVersion, TomlVersion};
 
 #[derive(Debug, Clone, Default)]
@@ -366,6 +367,15 @@ where
 
 fn format_impl(node: SyntaxNode, options: Options, context: Context) -> String {
     assert!(node.kind() == ROOT);
+
+    // A newline between an inline table's braces is TOML 1.1 syntax, so
+    // targeting 1.0 means the formatter must never produce one.
+    let mut options = options;
+    if resolve_version(&node, options.toml_version) == ResolvedVersion::V1_0 {
+        options.inline_table_expand = false;
+        options.inline_table_auto_collapse = true;
+    }
+
     let mut formatted = format_root(node, &options, &context);
 
     if formatted.ends_with("\r\n") {

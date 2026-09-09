@@ -1203,3 +1203,81 @@ sort_me_not = ["3", "2", "1"]
 
     assert_format!(expected, &formatted);
 }
+
+#[test]
+fn toml_1_0_leaves_a_wide_inline_table_on_one_line() {
+    let src = "very_long_inline_table = { array = [\"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\"] }\n";
+
+    let formatted = crate::formatter::format(src, formatter::Options::default());
+
+    assert_format!(src, &formatted);
+}
+
+#[test]
+fn toml_1_1_expands_a_wide_inline_table() {
+    let src = "very_long_inline_table = { array = [\"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\"] }\n";
+    let expected = "very_long_inline_table = {\n  array = [\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n  ],\n}\n";
+
+    let formatted = crate::formatter::format(
+        src,
+        formatter::Options {
+            toml_version: formatter::TomlVersion::V1_1,
+            ..Default::default()
+        },
+    );
+
+    assert_format!(expected, &formatted);
+}
+
+#[test]
+fn a_directive_expands_a_wide_inline_table() {
+    let src = "#:toml-version 1.1\nvery_long_inline_table = { array = [\"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\"] }\n";
+    let expected = "#:toml-version 1.1\nvery_long_inline_table = {\n  array = [\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n  ],\n}\n";
+
+    let formatted = crate::formatter::format(src, formatter::Options::default());
+
+    assert_format!(expected, &formatted);
+}
+
+#[test]
+fn toml_1_0_collapses_a_multiline_inline_table() {
+    let src = "dependency={\nversion=\"1\",optional=true,\n}\n";
+    let expected = "dependency = { version = \"1\", optional = true }\n";
+
+    let formatted = crate::formatter::format(
+        src,
+        formatter::Options {
+            toml_version: formatter::TomlVersion::V1_0,
+            inline_table_auto_collapse: false,
+            ..Default::default()
+        },
+    );
+
+    assert_format!(expected, &formatted);
+}
+
+#[test]
+fn toml_1_0_keeps_a_commented_inline_table_multiline() {
+    let src = "dependency={\n# version\nversion=\"1\",\noptional=true,\n}\n";
+    let expected = "dependency = {\n  # version\n  version = \"1\",\n  optional = true,\n}\n";
+
+    let formatted = crate::formatter::format(
+        src,
+        formatter::Options {
+            toml_version: formatter::TomlVersion::V1_0,
+            ..Default::default()
+        },
+    );
+
+    assert_format!(expected, &formatted);
+}
+
+#[test]
+fn an_already_multiline_document_keeps_expanding() {
+    let src = "already = {\n  a = 1,\n  b = 2,\n}\nvery_long_inline_table = { array = [\"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\", \"aaaaa\"] }\n";
+    let expected = "already = { a = 1, b = 2 }\nvery_long_inline_table = {\n  array = [\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n    \"aaaaa\",\n  ],\n}\n";
+
+    let formatted = crate::formatter::format(src, formatter::Options::default());
+
+    assert_format!(expected, &formatted);
+}

@@ -65,7 +65,7 @@ fn expands_long_inline_tables() {
     assert_format(
         "dependency = { version = \"1\", optional = true }\n",
         "dependency = {\n  version = \"1\",\n  optional = true,\n}\n",
-        &["column_width=40"],
+        &["column_width=40", "toml_version=1.1"],
     );
 }
 

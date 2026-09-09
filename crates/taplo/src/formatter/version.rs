@@ -74,7 +74,6 @@ pub enum ResolvedVersion {
 /// `configured`. Absent a directive, `configured` is used unless it is
 /// `Auto`, in which case the document is scanned for a multi-line inline
 /// table: a syntax construct TOML 1.0 does not allow.
-#[allow(dead_code)]
 pub(crate) fn resolve_version(root: &SyntaxNode, configured: TomlVersion) -> ResolvedVersion {
     if let Some(version) = directive_version(root) {
         return version;
