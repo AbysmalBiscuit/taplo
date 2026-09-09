@@ -164,3 +164,12 @@ fn preserves_single_line_tables_when_expansion_is_disabled() {
         &["column_width=20", "inline_table_expand=false"],
     );
 }
+
+#[test]
+fn keeps_a_nested_comment_out_of_the_toml_version() {
+    assert_format(
+        "a = { b = [1, # keep\n2] }\n",
+        "a = { b = [\n  1, # keep\n  2,\n] }\n",
+        &[],
+    );
+}

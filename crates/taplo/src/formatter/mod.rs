@@ -888,6 +888,21 @@ fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl 
     (node.into(), value, comment)
 }
 
+/// Whether rendering `node` on a single line would drop a comment.
+///
+/// Comments inside a nested array or inline table are written by that
+/// collection, which keeps its own line breaks, so only the comments this
+/// collection lays out itself are at risk.
+fn owns_comment(node: &SyntaxNode) -> bool {
+    node.children_with_tokens().any(|child| match child {
+        NodeOrToken::Token(t) => t.kind() == COMMENT,
+        NodeOrToken::Node(n) => match n.kind() {
+            ARRAY | INLINE_TABLE => false,
+            _ => owns_comment(&n),
+        },
+    })
+}
+
 fn format_collection(node: SyntaxNode, options: &Options, context: &Context) -> impl FormattedItem {
     let inline_table = node.kind() == INLINE_TABLE;
     let (opening, closing) = if inline_table { ('{', '}') } else { ('[', ']') };
@@ -914,7 +929,11 @@ fn format_collection(node: SyntaxNode, options: &Options, context: &Context) -> 
     let mut context = context.clone();
     context.force_multiline &= !inline_table || options.inline_table_expand;
     let context = &context;
-    let has_comments = node.descendants_with_tokens().any(|n| n.kind() == COMMENT);
+    let has_comments = if inline_table && context.version == ResolvedVersion::V1_0 {
+        owns_comment(&node)
+    } else {
+        node.descendants_with_tokens().any(|n| n.kind() == COMMENT)
+    };
     let has_newlines = if inline_table {
         node.children_with_tokens().any(|n| n.kind() == NEWLINE)
     } else {

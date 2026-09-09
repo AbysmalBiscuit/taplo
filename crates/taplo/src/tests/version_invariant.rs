@@ -1,9 +1,10 @@
 //! Formatting any fixture in the corpus under either target TOML version
 //! produces output that re-parses, and output targeting TOML 1.0 never
 //! contains a multi-line inline table: the one construct the formatter can
-//! introduce that TOML 1.0 forbids. An inline table holding a comment is the
-//! exception, it stays multi-line because collapsing it would drop the
-//! comment.
+//! introduce that TOML 1.0 forbids. An inline table that lays out a comment
+//! of its own is the exception, it stays multi-line because collapsing it
+//! would drop the comment. A comment nested inside one of its arrays does
+//! not count: that array writes the comment on its own line.
 
 use std::path::{Path, PathBuf};
 
@@ -131,13 +132,18 @@ fn formatted_output_matches_its_toml_version() {
         }
     }
 
-    // The corpus only exercises the version clamp through fixtures that are
-    // wide enough for the formatter to want to expand an inline table.
-    // Without this one, the test passes with the clamp removed.
-    let expanding_fixture = corpus_root().join("inline_table_expand.toml");
-    assert!(
-        checked_against_v1_0.contains(&expanding_fixture),
-        "{} was not checked against TOML 1.0 - without it this test has no teeth",
-        expanding_fixture.display(),
-    );
+    // Two shapes the rest of the corpus never produces: an inline table wide
+    // enough to want expanding, and one with a comment in a nested array.
+    // Without them this test passes with the clamp removed.
+    for name in [
+        "inline_table_expand.toml",
+        "inline_table_nested_comment.toml",
+    ] {
+        let required = corpus_root().join(name);
+        assert!(
+            checked_against_v1_0.contains(&required),
+            "{} was not checked against TOML 1.0 - without it this test has no teeth",
+            required.display(),
+        );
+    }
 }

@@ -72,9 +72,11 @@ What detection is good for is a floor: the formatter must not introduce syntax t
 
 **R5. Targeting 1.0 suppresses the construct, not the option.** Under 1.0, `inline_table_expand` does not expand: an inline table too wide for `column_width` stays on one line. `inline_table_auto_collapse` is forced on, because collapsing moves the document toward 1.0, and it overrides a configured `false`. `inline_table_trailing_comma` becomes unreachable, since it fires only on a table that renders multi-line.
 
-**R6. Output parses as what it claims to be.** Formatter output re-parses, and when the resolved version is 1.0 no inline table in the output contains a newline. This is asserted over the existing formatter corpus, not over one hand-written case.
+**R6. Output parses as what it claims to be.** Formatter output re-parses, and when the resolved version is 1.0 no inline table in the output breaks a line of its own between its braces. A newline belonging to a nested value does not count: TOML 1.0 allows one. This is asserted over the existing formatter corpus, not over one hand-written case.
 
-**R7. A comment outranks the version.** An inline table containing a comment cannot be collapsed without dropping the comment, so under 1.0 it is left as found. The formatter never discards a comment to satisfy a version. This is the one exception to R6 and the invariant test states it.
+**R7. A comment outranks the version.** An inline table that lays out a comment of its own cannot be collapsed without dropping the comment, so under 1.0 it is left as found. The formatter never discards a comment to satisfy a version. This is the one exception to R6 and the invariant test states it.
+
+The exception covers only the comments the table writes itself. A comment nested in one of its arrays belongs to that array, which keeps it on its own line inside the value, so the table can still collapse. Counting those comments expands a table that never needed expanding, and the result is output a 1.0 parser rejects.
 
 **R8. An unparseable directive is inert.** `#:toml-version 2.0` and `#:toml-version banana` leave resolution where it would have been without them. Formatting never fails because a directive could not be read: a directive is content inside someone's document, and a formatter that refuses to run over a comment it does not recognize is a formatter people stop running.
 
