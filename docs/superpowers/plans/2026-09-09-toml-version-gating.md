@@ -167,13 +167,13 @@ One hand-written case per behavior is not the requirement. Spec R6 asks that out
 
 - [ ] **Step 1: Write the test**
 
-A single test that walks every `.toml` fixture the crate already has under `crates/taplo/test-data` (check the path with `fd -e toml`; use whatever directory the existing generated tests read) plus the inline sources in `crates/taplo/src/tests/formatter.rs`, and for each one, under both `TomlVersion::V1_0` and `TomlVersion::V1_1`:
+A single test that walks every `.toml` fixture under the repo-root `test-data/` directory, excluding `test-data/invalid/` — those are the deliberately unparseable files behind `tests::generated::invalid::*` and formatting them is out of scope. Resolve the directory from `env!("CARGO_MANIFEST_DIR")` joined with `../../test-data`, matching how the crate's other fixture-reading tests locate it. For each fixture, under both `TomlVersion::V1_0` and `TomlVersion::V1_1`:
 
 1. Format it.
 2. Re-parse the output with `crate::parser::parse`. Assert `errors.is_empty()`.
 3. Under `V1_0` only: assert no `INLINE_TABLE` node in the re-parsed tree has a `NEWLINE` among its `children_with_tokens()`, *unless* that table contains a `COMMENT` — the R7 carve-out. The failure message names the fixture and the offending snippet.
 
-Skip fixtures that fail to parse as input; the corpus includes deliberately invalid files (`tests::generated::invalid::*`), and formatting those is out of scope.
+Skip any remaining fixture that fails to parse as input rather than asserting on it.
 
 Assert the corpus is non-empty, so a wrong path silently testing nothing fails loudly.
 
