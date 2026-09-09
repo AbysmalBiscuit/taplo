@@ -13,6 +13,7 @@ use schemars::JsonSchema;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[non_exhaustive]
 pub enum TomlVersion {
     /// Target TOML 1.0 unless the document already contains syntax that
     /// requires TOML 1.1.

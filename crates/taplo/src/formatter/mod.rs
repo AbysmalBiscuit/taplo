@@ -27,8 +27,8 @@ use schemars::JsonSchema;
 mod macros;
 mod version;
 
-use version::resolve_version;
-pub use version::{ResolvedVersion, TomlVersion};
+use version::{resolve_version, ResolvedVersion};
+pub use version::{InvalidTomlVersion, TomlVersion};
 
 #[derive(Debug, Clone, Default)]
 /// Scoped formatter options based on text ranges.
