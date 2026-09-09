@@ -17,6 +17,7 @@ jobs:
   test:
     name: Test on Rust stable
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install latest Rust toolchain
@@ -34,6 +35,7 @@ jobs:
   check_wasm32:
     name: Check on WASM
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install latest Rust toolchain
@@ -47,6 +49,7 @@ jobs:
   toml_test:
     name: Run toml-test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install latest Rust toolchain
@@ -67,6 +70,7 @@ jobs:
   test-msrv-lib:
     name: Test libraries with MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install latest Rust toolchain
@@ -82,6 +86,7 @@ jobs:
   test-msrv-bin:
     name: Test binaries with MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install latest Rust toolchain
@@ -97,6 +102,7 @@ jobs:
   test-msrv-wasm:
     name: Test WASM with MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install latest Rust toolchain
