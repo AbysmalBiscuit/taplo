@@ -25,6 +25,9 @@ use schemars::JsonSchema;
 
 #[macro_use]
 mod macros;
+mod version;
+
+pub use version::{ResolvedVersion, TomlVersion};
 
 #[derive(Debug, Clone, Default)]
 /// Scoped formatter options based on text ranges.
@@ -124,6 +127,14 @@ create_options!(
 
         /// Use CRLF line endings
         pub crlf: bool,
+
+        /// The TOML version the formatter targets.
+        ///
+        /// `Auto` targets TOML 1.0 unless the document already contains a
+        /// multi-line inline table, so formatting never introduces syntax a
+        /// TOML 1.0 parser rejects. A `#:toml-version` directive in the
+        /// document outranks this value.
+        pub toml_version: TomlVersion,
     }
 );
 
@@ -180,6 +191,7 @@ impl Default for Options {
             reorder_arrays: false,
             reorder_inline_tables: false,
             crlf: false,
+            toml_version: TomlVersion::Auto,
         }
     }
 }
