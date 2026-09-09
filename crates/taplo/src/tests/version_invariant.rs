@@ -1,8 +1,9 @@
-//! Asserts spec R6 over the formatter fixture corpus: formatting any fixture
-//! under either target TOML version produces output that re-parses cleanly,
-//! and output targeting TOML 1.0 never contains a multi-line inline table
-//! (the one construct the formatter can introduce that 1.0 forbids), except
-//! where R7 exempts an inline table holding a comment.
+//! Formatting any fixture in the corpus under either target TOML version
+//! produces output that re-parses, and output targeting TOML 1.0 never
+//! contains a multi-line inline table: the one construct the formatter can
+//! introduce that TOML 1.0 forbids. An inline table holding a comment is the
+//! exception, it stays multi-line because collapsing it would drop the
+//! comment.
 
 use std::path::{Path, PathBuf};
 
@@ -55,15 +56,16 @@ fn contains_comment(node: &crate::syntax::SyntaxNode) -> bool {
         .any(|c| c.kind() == SyntaxKind::COMMENT)
 }
 
+fn parses_as_toml_1_0(src: &str) -> Result<(), toml::de::Error> {
+    toml::from_str::<toml::Value>(src).map(|_| ())
+}
+
 #[test]
 fn formatted_output_matches_its_toml_version() {
     let mut fixtures = Vec::new();
     collect_fixtures(&corpus_root(), &mut fixtures);
-    assert!(
-        !fixtures.is_empty(),
-        "found no .toml fixtures under {} - check the corpus path",
-        corpus_root().display()
-    );
+
+    let mut checked_against_v1_0 = Vec::new();
 
     for fixture in &fixtures {
         let src = std::fs::read_to_string(fixture)
@@ -74,6 +76,11 @@ fn formatted_output_matches_its_toml_version() {
             // than assert on input the corpus never promised was valid.
             continue;
         }
+
+        // taplo's parser accepts more than TOML 1.0 on purpose, so a fixture
+        // the 1.0 parser already rejects as input says nothing about whether
+        // the formatter kept the output within 1.0.
+        let input_is_toml_1_0 = parses_as_toml_1_0(&src).is_ok();
 
         for configured in [TomlVersion::V1_0, TomlVersion::V1_1] {
             let formatted = formatter::format(
@@ -108,6 +115,29 @@ fn formatted_output_matches_its_toml_version() {
                     table.text(),
                 );
             }
+
+            if !input_is_toml_1_0 {
+                continue;
+            }
+
+            if let Err(err) = parses_as_toml_1_0(&formatted) {
+                panic!(
+                    "{} formatted for TomlVersion::V1_0 is not valid TOML 1.0: {err}\n---\n{formatted}",
+                    fixture.display(),
+                );
+            }
+
+            checked_against_v1_0.push(fixture.clone());
         }
     }
+
+    // The corpus only exercises the version clamp through fixtures that are
+    // wide enough for the formatter to want to expand an inline table.
+    // Without this one, the test passes with the clamp removed.
+    let expanding_fixture = corpus_root().join("inline_table_expand.toml");
+    assert!(
+        checked_against_v1_0.contains(&expanding_fixture),
+        "{} was not checked against TOML 1.0 - without it this test has no teeth",
+        expanding_fixture.display(),
+    );
 }
