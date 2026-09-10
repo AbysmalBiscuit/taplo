@@ -25,6 +25,10 @@ use schemars::JsonSchema;
 
 #[macro_use]
 mod macros;
+mod version;
+
+use version::{resolve_version, ResolvedVersion};
+pub use version::{InvalidTomlVersion, TomlVersion};
 
 #[derive(Debug, Clone, Default)]
 /// Scoped formatter options based on text ranges.
@@ -124,6 +128,14 @@ create_options!(
 
         /// Use CRLF line endings
         pub crlf: bool,
+
+        /// The TOML version the formatter targets.
+        ///
+        /// `Auto` targets TOML 1.0 unless the document already contains a
+        /// multi-line inline table, so formatting never introduces syntax a
+        /// TOML 1.0 parser rejects. A `#:toml-version` directive in the
+        /// document outranks this value.
+        pub toml_version: TomlVersion,
     }
 );
 
@@ -180,6 +192,7 @@ impl Default for Options {
             reorder_arrays: false,
             reorder_inline_tables: false,
             crlf: false,
+            toml_version: TomlVersion::Auto,
         }
     }
 }
@@ -208,6 +221,9 @@ struct Context {
     force_multiline: bool,
     errors: Rc<[TextRange]>,
     scopes: Rc<ScopedOptions>,
+    /// The version the document is formatted against, set once the root node
+    /// is known and used to clamp scoped options back to it.
+    version: ResolvedVersion,
 }
 
 impl Default for Context {
@@ -217,6 +233,7 @@ impl Default for Context {
             force_multiline: Default::default(),
             errors: Rc::from([]),
             scopes: Default::default(),
+            version: ResolvedVersion::V1_1,
         }
     }
 }
@@ -229,6 +246,8 @@ impl Context {
                 opts.update(s.clone());
             }
         }
+
+        clamp_to_version(opts, self.version);
     }
 
     fn error_at(&self, range: TextRange) -> bool {
@@ -352,8 +371,27 @@ where
     Ok(s)
 }
 
+/// A newline between an inline table's braces is TOML 1.1 syntax, so
+/// targeting 1.0 means the formatter must never produce one.
+///
+/// Scoped options are layered on top of the document-wide options, so this
+/// runs again after every scope update: the target version is a property of
+/// the document and a per-key rule cannot opt out of it.
+fn clamp_to_version(options: &mut Options, version: ResolvedVersion) {
+    if version == ResolvedVersion::V1_0 {
+        options.inline_table_expand = false;
+        options.inline_table_auto_collapse = true;
+    }
+}
+
 fn format_impl(node: SyntaxNode, options: Options, context: Context) -> String {
     assert!(node.kind() == ROOT);
+
+    let mut options = options;
+    let mut context = context;
+    context.version = resolve_version(&node, options.toml_version);
+    clamp_to_version(&mut options, context.version);
+
     let mut formatted = format_root(node, &options, &context);
 
     if formatted.ends_with("\r\n") {
@@ -850,6 +888,21 @@ fn format_value(node: SyntaxNode, options: &Options, context: &Context) -> impl 
     (node.into(), value, comment)
 }
 
+/// Whether rendering `node` on a single line would drop a comment.
+///
+/// Comments inside a nested array or inline table are written by that
+/// collection, which keeps its own line breaks, so only the comments this
+/// collection lays out itself are at risk.
+fn owns_comment(node: &SyntaxNode) -> bool {
+    node.children_with_tokens().any(|child| match child {
+        NodeOrToken::Token(t) => t.kind() == COMMENT,
+        NodeOrToken::Node(n) => match n.kind() {
+            ARRAY | INLINE_TABLE => false,
+            _ => owns_comment(&n),
+        },
+    })
+}
+
 fn format_collection(node: SyntaxNode, options: &Options, context: &Context) -> impl FormattedItem {
     let inline_table = node.kind() == INLINE_TABLE;
     let (opening, closing) = if inline_table { ('{', '}') } else { ('[', ']') };
@@ -876,7 +929,11 @@ fn format_collection(node: SyntaxNode, options: &Options, context: &Context) -> 
     let mut context = context.clone();
     context.force_multiline &= !inline_table || options.inline_table_expand;
     let context = &context;
-    let has_comments = node.descendants_with_tokens().any(|n| n.kind() == COMMENT);
+    let has_comments = if inline_table && context.version == ResolvedVersion::V1_0 {
+        owns_comment(&node)
+    } else {
+        node.descendants_with_tokens().any(|n| n.kind() == COMMENT)
+    };
     let has_newlines = if inline_table {
         node.children_with_tokens().any(|n| n.kind() == NEWLINE)
     } else {

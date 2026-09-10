@@ -1,0 +1,5 @@
+[dependencies]
+serde = { version = "1", features = [
+  "derive", # the config types derive their impls
+  "std",
+] }

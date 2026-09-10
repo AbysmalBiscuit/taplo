@@ -5,6 +5,7 @@ mod generated {
 }
 
 mod formatter;
+mod version_invariant;
 
 #[test]
 fn time_in_arrays() {

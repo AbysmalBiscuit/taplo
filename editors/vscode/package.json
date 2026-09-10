@@ -313,6 +313,13 @@
           "default": null,
           "description": "Put trailing commas for multiline inline tables. Enabled by default."
         },
+        "evenBetterToml.formatter.tomlVersion": {
+          "scope": "resource",
+          "type": "string",
+          "enum": ["auto", "1.0", "1.1"],
+          "default": "auto",
+          "markdownDescription": "The TOML version the formatter targets. `auto` targets TOML 1.0 unless the document already contains a multi-line inline table, in which case it targets 1.1, so formatting never introduces syntax a TOML 1.0 parser rejects. A `#:toml-version` directive at the top of the document outranks this setting."
+        },
         "evenBetterToml.formatter.arrayAutoCollapse": {
           "scope": "resource",
           "type": "boolean",
