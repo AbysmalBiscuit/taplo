@@ -1,0 +1,26 @@
+name: Security audit
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # New advisories land without code changes, so audit main every week too.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit Cargo.lock
+        run: cargo audit
