@@ -19,7 +19,7 @@ pub fn dom(c: &mut Criterion) {
 #[cfg(unix)]
 criterion_group!(
     name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Protobuf));
     targets = syntax, dom
 );
 

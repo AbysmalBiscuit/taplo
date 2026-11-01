@@ -125,17 +125,20 @@ impl<E: Environment> Taplo<E> {
         let mut post_line = 0_usize;
 
         for (idx, diff_op) in hunks.into_iter().enumerate() {
-            use ansi_term::Colour::{self, Green, Red};
+            use owo_colors::{
+                AnsiColors::{self, Green, Red},
+                OwoColorize,
+            };
             use prettydiff::basic::DiffOp;
 
             // apply the given color and prefix to the set of strings `s`
             fn apply_color<'a>(
                 s: &'a [&'a str],
                 prefix: &'a str,
-                color: Colour,
+                color: AnsiColors,
             ) -> impl IntoIterator<Item = String> + 'a {
                 s.iter()
-                    .map(move |&s| color.paint(prefix.to_owned() + s).to_string())
+                    .map(move |&s| (prefix.to_owned() + s).color(color).to_string())
             }
 
             let mut pre_length = 0_usize;
