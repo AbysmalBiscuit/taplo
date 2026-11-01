@@ -8,7 +8,7 @@ resolver = "2"
 authors      = ["tamasfe"]
 edition      = "2021"
 license      = "MIT"
-rust-version = "1.85"
+rust-version = "1.88"
 homepage     = "https://taplo.tamasfe.dev"
 repository   = "https://github.com/tamasfe/taplo"
 
