@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/AbysmalBiscuit/taplo/compare/v0.10.1...v0.10.2) (2026-11-02)
+
+
+### Bug Fixes
+
+* **deps:** clear all cargo audit findings ([#5](https://github.com/AbysmalBiscuit/taplo/issues/5)) ([f93dce8](https://github.com/AbysmalBiscuit/taplo/commit/f93dce80bfb6e6d4a7524bf3d6f25edc70748995))
+
 ## [0.10.1](https://github.com/AbysmalBiscuit/taplo/compare/v0.10.0...v0.10.1) (2026-09-10)
 
 
