@@ -1,11 +1,9 @@
-use difference::Changeset;
-
 use crate::formatter::{self, Options, OptionsIncomplete};
 
 macro_rules! assert_format {
     ($expected:expr, $actual:expr) => {
         if $expected != $actual {
-            println!("{}", Changeset::new($actual, $expected, "\n"));
+            println!("{}", prettydiff::diff_lines($actual, $expected));
             panic!("invalid formatting");
         }
     };
